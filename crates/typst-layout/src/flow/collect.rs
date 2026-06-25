@@ -161,6 +161,44 @@ impl<'a> Collector<'a, '_, '_> {
         elem: &'a Packed<ParElem>,
         styles: StyleChain<'a>,
     ) -> SourceResult<()> {
+        // Defer iff the immediately-preceding child (skipping only Tags) is a
+        // side-wrap float. Any intervening Rel/Flush/Frame fails this match and
+        // falls through to the normal under-the-float path (POC scope guard).
+        let prev_float = self
+            .output
+            .iter()
+            .rev()
+            .find(|c| !matches!(c, Child::Tag(_)))
+            .and_then(|c| match c {
+                Child::Placed(p) if p.float && p.wrap => {
+                    // Mark that a deferred wrapping paragraph follows this
+                    // float, so the distributor reserves zero height for it
+                    // (rather than the Step-4 under-the-float fallback).
+                    p.wrap_active.set(true);
+                    Some(p.clearance)
+                }
+                _ => None,
+            });
+
+        if let Some(clearance) = prev_float {
+            // NOTE: this next() MUST stay here, before the push and before the
+            // early return — it preserves SplitLocator ordering identical to
+            // the non-deferred path so in-paragraph labels/refs resolve to the
+            // same Location with or without the float. Do not move it.
+            let locator = self.locator.next(&elem.span());
+            self.output.push(Child::Deferred(self.boxed(DeferredParChild {
+                elem,
+                styles,
+                locator,
+                base: self.base,
+                expand: self.expand,
+                par_situation: self.par_situation,
+                clearance,
+            })));
+            self.par_situation = ParSituation::Consecutive;
+            return Ok(());
+        }
+
         let lines = crate::inline::layout_par(
             elem,
             self.engine,
@@ -169,6 +207,7 @@ impl<'a> Collector<'a, '_, '_> {
             self.base,
             self.expand,
             self.par_situation,
+            None,
         )?
         .into_frames();
 
@@ -195,46 +234,12 @@ impl<'a> Collector<'a, '_, '_> {
 
     /// Collect laid-out lines.
     fn lines(&mut self, lines: Vec<Frame>, leading: Abs, styles: StyleChain<'a>) {
-        let align = styles.resolve(AlignElem::alignment);
-        let costs = styles.get(TextElem::costs);
-
-        // Determine whether to prevent widow and orphans.
-        let len = lines.len();
-        let prevent_orphans =
-            costs.orphan() > Ratio::zero() && len >= 2 && !lines[1].is_empty();
-        let prevent_widows =
-            costs.widow() > Ratio::zero() && len >= 2 && !lines[len - 2].is_empty();
-        let prevent_all = len == 3 && prevent_orphans && prevent_widows;
-
-        // Store the heights of lines at the edges because we'll potentially
-        // need these later when `lines` is already moved.
-        let height_at = |i| lines.get(i).map(Frame::height).unwrap_or_default();
-        let front_1 = height_at(0);
-        let front_2 = height_at(1);
-        let back_2 = height_at(len.saturating_sub(2));
-        let back_1 = height_at(len.saturating_sub(1));
-
-        for (i, frame) in lines.into_iter().enumerate() {
+        let line_children = build_line_children(lines, leading, styles);
+        for (i, line) in line_children.into_iter().enumerate() {
             if i > 0 {
                 self.output.push(Child::Rel(leading.into(), 5));
             }
-
-            // To prevent widows and orphans, we require enough space for
-            // - all lines if it's just three
-            // - the first two lines if we're at the first line
-            // - the last two lines if we're at the second to last line
-            let need = if prevent_all && i == 0 {
-                front_1 + leading + front_2 + leading + back_1
-            } else if prevent_orphans && i == 0 {
-                front_1 + leading + front_2
-            } else if prevent_widows && i >= 2 && i + 2 == len {
-                back_2 + leading + back_1
-            } else {
-                frame.height()
-            };
-
-            self.output
-                .push(Child::Line(self.boxed(LineChild { frame, align, need })));
+            self.output.push(Child::Line(self.boxed(line)));
         }
     }
 
@@ -300,26 +305,61 @@ impl<'a> Collector<'a, '_, '_> {
         let align_y = alignment.map(|align| align.y().map(|y| y.resolve(styles)));
         let scope = elem.scope.get(styles);
         let float = elem.float.get(styles);
+        let wrap = elem.wrap.get(styles);
 
-        match (float, align_y) {
-            (true, Smart::Custom(None | Some(FixedAlignment::Center))) => bail!(
-                elem.span(),
-                "vertical floating placement must be `auto`, `top`, or `bottom`"
-            ),
-            (false, Smart::Auto) => bail!(
-                elem.span(),
-                "automatic positioning is only available for floating placement";
-                hint: "you can enable floating placement with `place(float: true, ..)`";
-            ),
-            _ => {}
-        }
+        if wrap {
+            // Side-wrapping floats reflow surrounding text into a narrowed
+            // measure. They anchor in place (no vertical alignment, i.e. at the
+            // current flow position) on a definite horizontal side, within a
+            // single column. These rules supersede the general float rules
+            // below, since an in-place vertical anchor is otherwise rejected.
+            if !float {
+                bail!(
+                    elem.span(),
+                    "wrapping placement is only available for floating placement";
+                    hint: "you can enable floating placement with `place(float: true, ..)`";
+                );
+            }
+            if !matches!(align_x, FixedAlignment::Start | FixedAlignment::End) {
+                bail!(
+                    elem.span(),
+                    "wrapping placement requires a `left` or `right` alignment"
+                );
+            }
+            if !matches!(align_y, Smart::Custom(None)) {
+                bail!(
+                    elem.span(),
+                    "wrapping placement anchors the float at its position in the text";
+                    hint: "remove the `top`/`bottom`/`horizon` vertical alignment";
+                );
+            }
+            if scope == PlacementScope::Parent {
+                bail!(
+                    elem.span(),
+                    "wrapping placement is not supported for parent scope"
+                );
+            }
+        } else {
+            match (float, align_y) {
+                (true, Smart::Custom(None | Some(FixedAlignment::Center))) => bail!(
+                    elem.span(),
+                    "vertical floating placement must be `auto`, `top`, or `bottom`"
+                ),
+                (false, Smart::Auto) => bail!(
+                    elem.span(),
+                    "automatic positioning is only available for floating placement";
+                    hint: "you can enable floating placement with `place(float: true, ..)`";
+                ),
+                _ => {}
+            }
 
-        if !float && scope == PlacementScope::Parent {
-            bail!(
-                elem.span(),
-                "parent-scoped positioning is currently only available for floating placement";
-                hint: "you can enable floating placement with `place(float: true, ..)`";
-            );
+            if !float && scope == PlacementScope::Parent {
+                bail!(
+                    elem.span(),
+                    "parent-scoped positioning is currently only available for floating placement";
+                    hint: "you can enable floating placement with `place(float: true, ..)`";
+                );
+            }
         }
 
         let locator = self.locator.next(&elem.span());
@@ -330,6 +370,8 @@ impl<'a> Collector<'a, '_, '_> {
             align_y,
             scope,
             float,
+            wrap,
+            wrap_active: std::cell::Cell::new(false),
             clearance,
             delta,
             elem,
@@ -347,6 +389,56 @@ impl<'a> Collector<'a, '_, '_> {
     fn boxed<T>(&self, value: T) -> BumpBox<'a, T> {
         BumpBox::new_in(value, self.bump)
     }
+}
+
+/// Build [`LineChild`]ren from laid-out line frames, computing the widow/orphan
+/// `need` for each line. Shared by `Collector::lines` (the normal paragraph
+/// path) and the distributor's deferred-wrap paths so that the `need` ladder is
+/// byte-identical across both. The caller is responsible for inserting the
+/// inter-line `Child::Rel`/spacing between consecutive children.
+pub(crate) fn build_line_children(
+    lines: Vec<Frame>,
+    leading: Abs,
+    styles: StyleChain,
+) -> Vec<LineChild> {
+    let align = styles.resolve(AlignElem::alignment);
+    let costs = styles.get(TextElem::costs);
+
+    // Determine whether to prevent widow and orphans.
+    let len = lines.len();
+    let prevent_orphans =
+        costs.orphan() > Ratio::zero() && len >= 2 && !lines[1].is_empty();
+    let prevent_widows =
+        costs.widow() > Ratio::zero() && len >= 2 && !lines[len - 2].is_empty();
+    let prevent_all = len == 3 && prevent_orphans && prevent_widows;
+
+    // Store the heights of lines at the edges because we'll potentially
+    // need these later when `lines` is already moved.
+    let height_at = |i| lines.get(i).map(Frame::height).unwrap_or_default();
+    let front_1 = height_at(0);
+    let front_2 = height_at(1);
+    let back_2 = height_at(len.saturating_sub(2));
+    let back_1 = height_at(len.saturating_sub(1));
+
+    let mut output = Vec::with_capacity(len);
+    for (i, frame) in lines.into_iter().enumerate() {
+        // To prevent widows and orphans, we require enough space for
+        // - all lines if it's just three
+        // - the first two lines if we're at the first line
+        // - the last two lines if we're at the second to last line
+        let need = if prevent_all && i == 0 {
+            front_1 + leading + front_2 + leading + back_1
+        } else if prevent_orphans && i == 0 {
+            front_1 + leading + front_2
+        } else if prevent_widows && i >= 2 && i + 2 == len {
+            back_2 + leading + back_1
+        } else {
+            frame.height()
+        };
+
+        output.push(LineChild { frame, align, need });
+    }
+    output
 }
 
 /// A prepared child in flow layout.
@@ -368,6 +460,8 @@ pub enum Child<'a> {
     Multi(BumpBox<'a, MultiChild<'a>>),
     /// An absolutely or floatingly placed element.
     Placed(BumpBox<'a, PlacedChild<'a>>),
+    /// A paragraph deferred for break-beside-float in the distributor.
+    Deferred(BumpBox<'a, DeferredParChild<'a>>),
     /// A place flush.
     Flush,
     /// An explicit column break.
@@ -375,11 +469,26 @@ pub enum Child<'a> {
 }
 
 /// A child that encapsulates a layouted line of a paragraph.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LineChild {
     pub frame: Frame,
     pub align: Axes<FixedAlignment>,
     pub need: Abs,
+}
+
+/// A paragraph deferred because it immediately follows a side-wrap float.
+/// Broken in the distributor once the float's height is known. POC scope:
+/// nothing but tags sits between the float and this paragraph.
+#[derive(Debug)]
+pub struct DeferredParChild<'a> {
+    pub elem: &'a Packed<ParElem>,
+    pub styles: StyleChain<'a>,
+    pub locator: Locator<'a>,
+    pub base: Size,
+    pub expand: bool,
+    pub par_situation: ParSituation,
+    /// Clearance copied from the preceding float.
+    pub clearance: Abs,
 }
 
 /// A child that encapsulates a prepared unbreakable block.
@@ -633,6 +742,20 @@ impl MultiSpill<'_, '_> {
     }
 }
 
+/// Remaining full-width lines of a wrapped paragraph, carried to the next
+/// region. Lines are already broken (continuation lines are full-width by
+/// construction); we only need to re-gate them against the new region. Mirrors
+/// `MultiSpill`'s role for the deferred side-wrap-float paragraph path.
+#[derive(Debug, Clone)]
+pub struct WrapSpill {
+    /// Pre-broken, full-width continuation line frames (in order).
+    pub lines: Vec<LineChild>,
+    /// Leading to insert between consecutive lines (`Rel` weakness 5).
+    pub leading: Abs,
+    /// Trailing paragraph spacing to emit after the last line (`Rel` weakness 4).
+    pub spacing: Abs,
+}
+
 /// A child that encapsulates a prepared placed element.
 #[derive(Debug)]
 pub struct PlacedChild<'a> {
@@ -640,6 +763,12 @@ pub struct PlacedChild<'a> {
     pub align_y: Smart<Option<FixedAlignment>>,
     pub scope: PlacementScope,
     pub float: bool,
+    pub wrap: bool,
+    /// Set during collection iff a `Child::Deferred` paragraph was produced for
+    /// this side-wrap float (i.e. a wrapping paragraph immediately follows it).
+    /// Interior-mutable so the immutable `Collector::par` scan can set it; it is
+    /// never hashed (PlacedChild already holds a non-hashed `CachedCell`).
+    pub wrap_active: std::cell::Cell<bool>,
     pub clearance: Abs,
     pub delta: Axes<Rel<Abs>>,
     elem: &'a Packed<PlaceElem>,

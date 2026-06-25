@@ -16,6 +16,7 @@ use typst_utils::Scalar;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::*;
+use crate::flow::wrap::WidthProvider;
 
 /// The cost of a line or inline layout.
 type Cost = f64;
@@ -152,26 +153,51 @@ impl Trim {
 pub fn linebreak<'a>(
     engine: &Engine,
     p: &'a Preparation<'a>,
-    width: Abs,
+    width: WidthProvider<'_>,
 ) -> Vec<Line<'a>> {
-    match p.config.linebreaks {
-        Linebreaks::Simple => linebreak_simple(engine, p, width),
-        Linebreaks::Optimized => linebreak_optimized(engine, p, width),
+    match width {
+        // A wrapping paragraph must use the greedy breaker: it commits lines in
+        // order and can therefore consult a per-line measure. Knuth-Plass bakes
+        // in a single scalar width and cannot.
+        WidthProvider::Variable(_) => linebreak_simple(engine, p, width),
+        WidthProvider::Uniform(uniform) => match p.config.linebreaks {
+            Linebreaks::Simple => linebreak_simple(engine, p, width),
+            // The optimized breaker only ever uses a single measure, so its
+            // lines never wrap: they keep the default zero `narrowing`/offset.
+            Linebreaks::Optimized => linebreak_optimized(engine, p, uniform),
+        },
     }
+}
+
+/// Records onto a line the offset and measure it was broken against, so later
+/// stages place and justify it correctly.
+fn stamp_line(line: &mut Line<'_>, width: WidthProvider<'_>, k: usize) {
+    let (x_offset, available) = width.at(k);
+    line.x_offset = x_offset;
+    // Store the reduction from the full measure (zero when not wrapping) so
+    // `commit` shrinks the justification slack by exactly the reserved width.
+    line.narrowing = width.full_width() - available;
 }
 
 /// Performs line breaking in simple first-fit style. This means that we build
 /// lines greedily, always taking the longest possible line. This may lead to
 /// very unbalanced line, but is fast and simple.
+///
+/// The measure may vary per line (when wrapping around a float): lines are
+/// committed strictly in order, so each is broken against `width.width_at(k)`
+/// for its line index `k`.
 #[typst_macros::time]
 fn linebreak_simple<'a>(
     engine: &Engine,
     p: &'a Preparation<'a>,
-    width: Abs,
+    width: WidthProvider<'_>,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::with_capacity(16);
     let mut start = 0;
     let mut last = None;
+    // Index of the line currently being assembled. Lines commit in order, so
+    // this is the index the width provider is queried with.
+    let mut k = 0;
 
     breakpoints(p, |end, breakpoint, eaten| {
         // Compute the line and its size.
@@ -180,10 +206,12 @@ fn linebreak_simple<'a>(
         // If the line doesn't fit anymore, we push the last fitting attempt
         // into the stack and rebuild the line from the attempt's end. The
         // resulting line cannot be broken up further.
-        if !width.fits(attempt.width)
-            && let Some((last_attempt, last_end)) = last.take()
+        if !width.width_at(k).fits(attempt.width)
+            && let Some((mut last_attempt, last_end)) = last.take()
         {
+            stamp_line(&mut last_attempt, width, k);
             lines.push(last_attempt);
+            k += 1;
             start = last_end;
             attempt = line(engine, p, start..end, breakpoint, lines.last(), eaten);
         }
@@ -191,8 +219,10 @@ fn linebreak_simple<'a>(
         // Finish the current line if there is a mandatory line break (i.e. due
         // to "\n") or if the line doesn't fit horizontally already since then
         // no shorter line will be possible.
-        if breakpoint == Breakpoint::Mandatory || !width.fits(attempt.width) {
+        if breakpoint == Breakpoint::Mandatory || !width.width_at(k).fits(attempt.width) {
+            stamp_line(&mut attempt, width, k);
             lines.push(attempt);
+            k += 1;
             start = end;
             last = None;
         } else {
@@ -200,7 +230,8 @@ fn linebreak_simple<'a>(
         }
     });
 
-    if let Some((line, _)) = last {
+    if let Some((mut line, _)) = last {
+        stamp_line(&mut line, width, k);
         lines.push(line);
     }
 

@@ -270,6 +270,17 @@ impl<'a, 'b> Composer<'a, 'b, '_, '_> {
         clearance: bool,
         migratable: bool,
     ) -> FlowResult<()> {
+        // Side-wrap floats are handled entirely by the distributor's
+        // placed()/deferred_par() path (anchored in place, broken beside or
+        // above their following content). They must never be hoisted here, as
+        // that would lose the wrap+anchor semantics and trigger Stop::Relayout.
+        // If we reach this with one — out of POC scope (e.g. it was queued) —
+        // treat it as a no-op: do not hoist, do not reserve, do not Relayout.
+        // (The POC fixture never hits this: the float fits, no prior floats.)
+        if placed.float && placed.wrap {
+            return Ok(());
+        }
+
         // If the float is already processed, skip it.
         let loc = placed.location();
         if self.skipped(loc) {
@@ -319,17 +330,25 @@ impl<'a, 'b> Composer<'a, 'b, '_, '_> {
         // Handle footnotes in the float.
         self.footnotes(regions, &frame, need, false, migratable)?;
 
-        // Determine the float's vertical alignment. We can unwrap the inner
-        // `Option` because `Custom(None)` is checked for during collection.
-        let align_y = placed.align_y.map(Option::unwrap).unwrap_or_else(|| {
-            // When the float's vertical midpoint would be above the middle of
-            // the page if it were layouted in-flow, we use top alignment.
-            // Otherwise, we use bottom alignment.
-            let used = base.y - remaining;
-            let half = need / 2.0;
-            let ratio = (used + half) / base.y;
-            if ratio <= 0.5 { FixedAlignment::Start } else { FixedAlignment::End }
-        });
+        // Determine the float's vertical alignment.
+        //
+        // A wrapping float anchors at its position in the text and carries
+        // `Custom(None)` (no vertical alignment). Until in-place anchoring is
+        // implemented, it is treated like an automatically-aligned float so it
+        // renders without panicking. For a non-wrapping float, `Custom(None)`
+        // cannot occur (it is rejected during collection).
+        let align_y = match placed.align_y {
+            Smart::Custom(Some(align)) => align,
+            Smart::Auto | Smart::Custom(None) => {
+                // When the float's vertical midpoint would be above the middle
+                // of the page if it were layouted in-flow, we use top
+                // alignment. Otherwise, we use bottom alignment.
+                let used = base.y - remaining;
+                let half = need / 2.0;
+                let ratio = (used + half) / base.y;
+                if ratio <= 0.5 { FixedAlignment::Start } else { FixedAlignment::End }
+            }
+        };
 
         // Select the insertion area where we'll put this float.
         let area = match placed.scope {

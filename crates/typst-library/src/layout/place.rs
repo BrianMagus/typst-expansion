@@ -137,10 +137,23 @@ pub struct PlaceElem {
     /// ```
     pub float: bool,
 
+    /// Whether in-flow content wraps around the side of this floating element
+    /// instead of being fully displaced past it.
+    ///
+    /// Requires `float` to be `{true}`, a `{left}` or `{right}`
+    /// @place.alignment[`alignment`] with no vertical component (the float
+    /// anchors at its position in the text), and a column @place.scope[`scope`].
+    /// If no alignment is given, the float wraps on the `{left}`. When enabled,
+    /// in-flow paragraph text reflows into the narrowed measure beside the
+    /// element for as many lines as the element is tall, then resumes the full
+    /// column width below it.
+    pub wrap: bool,
+
     /// The spacing between the placed element and other elements in a floating
     /// layout.
     ///
-    /// Has no effect if `float` is `{false}`.
+    /// Has no effect if `float` is `{false}`. For a @place.wrap[wrapping] float,
+    /// this is the horizontal gutter between the element and the wrapping text.
     #[default(Em::new(1.5).into())]
     pub clearance: Length,
 

@@ -4,6 +4,7 @@ mod block;
 mod collect;
 mod compose;
 mod distribute;
+pub(crate) mod wrap;
 
 pub(crate) use self::block::unbreakable_pod;
 
@@ -33,7 +34,8 @@ use typst_utils::{LazyHash, NonZeroExt, Numeric, Protected};
 
 use self::block::{layout_multi_block, layout_single_block};
 use self::collect::{
-    Child, LineChild, MultiChild, MultiSpill, PlacedChild, SingleChild, collect,
+    Child, DeferredParChild, LineChild, MultiChild, MultiSpill, PlacedChild, SingleChild,
+    WrapSpill, collect,
 };
 use self::compose::{Composer, compose};
 use self::distribute::distribute;
@@ -296,6 +298,10 @@ struct Work<'a, 'b> {
     children: &'b [Child<'a>],
     /// Leftovers from a breakable block.
     spill: Option<MultiSpill<'a, 'b>>,
+    /// Already-broken, full-width continuation lines of a wrapped paragraph
+    /// that didn't fit beside/after its float in the prior region. Carried
+    /// verbatim (no re-break) to be emitted full-width on the next region.
+    wrap_spill: Option<WrapSpill>,
     /// Queued floats that didn't fit in previous regions.
     floats: EcoVec<&'b PlacedChild<'a>>,
     /// Queued footnotes that didn't fit in previous regions.
@@ -316,6 +322,7 @@ impl<'a, 'b> Work<'a, 'b> {
         Self {
             children,
             spill: None,
+            wrap_spill: None,
             floats: EcoVec::new(),
             footnotes: EcoVec::new(),
             footnote_spill: None,
@@ -338,6 +345,7 @@ impl<'a, 'b> Work<'a, 'b> {
     fn done(&self) -> bool {
         self.children.is_empty()
             && self.spill.is_none()
+            && self.wrap_spill.is_none()
             && self.floats.is_empty()
             && self.footnote_spill.is_none()
             && self.footnotes.is_empty()
