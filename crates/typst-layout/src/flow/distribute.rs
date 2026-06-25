@@ -434,6 +434,33 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
 
     /// Processes an absolutely or floatingly placed child.
     fn placed(&mut self, placed: &'b PlacedChild<'a>) -> FlowResult<()> {
+        if placed.float && placed.wrap {
+            // A side-wrapping float anchors at its position in the text rather
+            // than being hoisted to the column top/bottom: lay it out, draw it
+            // flush to its side, and reserve its height so following content
+            // flows below it. (Reflowing the following paragraph *beside* it is
+            // wired in a later step; for now the text continues underneath.)
+            let frame = placed.layout(self.composer.engine, self.regions.base())?;
+
+            // Like any non-sticky in-flow frame, a wrap float interrupts a run
+            // of sticky blocks, so forget any saved snapshot (cf. `frame`).
+            if !frame.is_empty() {
+                self.sticky = None;
+                self.stickable = None;
+            }
+
+            // The float reserves its height in flow, so gate footnotes on that
+            // height (as `frame` does), not zero (as overlaid placement does).
+            self.composer
+                .footnotes(&self.regions, &frame, frame.height(), true, true)?;
+            self.flush_tags();
+            self.regions.size.y -= frame.height();
+            self.items.push(Item::Frame(
+                frame,
+                Axes::new(placed.align_x, FixedAlignment::Start),
+            ));
+            return Ok(());
+        }
         if placed.float {
             // If the element is floatingly placed, let the composer handle it.
             // It might require relayout because the area available for
