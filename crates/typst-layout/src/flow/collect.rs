@@ -161,6 +161,44 @@ impl<'a> Collector<'a, '_, '_> {
         elem: &'a Packed<ParElem>,
         styles: StyleChain<'a>,
     ) -> SourceResult<()> {
+        // Defer iff the immediately-preceding child (skipping only Tags) is a
+        // side-wrap float. Any intervening Rel/Flush/Frame fails this match and
+        // falls through to the normal under-the-float path (POC scope guard).
+        let prev_float = self
+            .output
+            .iter()
+            .rev()
+            .find(|c| !matches!(c, Child::Tag(_)))
+            .and_then(|c| match c {
+                Child::Placed(p) if p.float && p.wrap => {
+                    // Mark that a deferred wrapping paragraph follows this
+                    // float, so the distributor reserves zero height for it
+                    // (rather than the Step-4 under-the-float fallback).
+                    p.wrap_active.set(true);
+                    Some(p.clearance)
+                }
+                _ => None,
+            });
+
+        if let Some(clearance) = prev_float {
+            // NOTE: this next() MUST stay here, before the push and before the
+            // early return — it preserves SplitLocator ordering identical to
+            // the non-deferred path so in-paragraph labels/refs resolve to the
+            // same Location with or without the float. Do not move it.
+            let locator = self.locator.next(&elem.span());
+            self.output.push(Child::Deferred(self.boxed(DeferredParChild {
+                elem,
+                styles,
+                locator,
+                base: self.base,
+                expand: self.expand,
+                par_situation: self.par_situation,
+                clearance,
+            })));
+            self.par_situation = ParSituation::Consecutive;
+            return Ok(());
+        }
+
         let lines = crate::inline::layout_par(
             elem,
             self.engine,
@@ -169,6 +207,7 @@ impl<'a> Collector<'a, '_, '_> {
             self.base,
             self.expand,
             self.par_situation,
+            None,
         )?
         .into_frames();
 
@@ -358,6 +397,7 @@ impl<'a> Collector<'a, '_, '_> {
             scope,
             float,
             wrap,
+            wrap_active: std::cell::Cell::new(false),
             clearance,
             delta,
             elem,
@@ -396,6 +436,8 @@ pub enum Child<'a> {
     Multi(BumpBox<'a, MultiChild<'a>>),
     /// An absolutely or floatingly placed element.
     Placed(BumpBox<'a, PlacedChild<'a>>),
+    /// A paragraph deferred for break-beside-float in the distributor.
+    Deferred(BumpBox<'a, DeferredParChild<'a>>),
     /// A place flush.
     Flush,
     /// An explicit column break.
@@ -408,6 +450,21 @@ pub struct LineChild {
     pub frame: Frame,
     pub align: Axes<FixedAlignment>,
     pub need: Abs,
+}
+
+/// A paragraph deferred because it immediately follows a side-wrap float.
+/// Broken in the distributor once the float's height is known. POC scope:
+/// nothing but tags sits between the float and this paragraph.
+#[derive(Debug)]
+pub struct DeferredParChild<'a> {
+    pub elem: &'a Packed<ParElem>,
+    pub styles: StyleChain<'a>,
+    pub locator: Locator<'a>,
+    pub base: Size,
+    pub expand: bool,
+    pub par_situation: ParSituation,
+    /// Clearance copied from the preceding float.
+    pub clearance: Abs,
 }
 
 /// A child that encapsulates a prepared unbreakable block.
@@ -661,9 +718,12 @@ pub struct PlacedChild<'a> {
     pub align_y: Smart<Option<FixedAlignment>>,
     pub scope: PlacementScope,
     pub float: bool,
-    // Consumed by the wrap-layout path added in a later step; plumbed now.
-    #[allow(dead_code)]
     pub wrap: bool,
+    /// Set during collection iff a `Child::Deferred` paragraph was produced for
+    /// this side-wrap float (i.e. a wrapping paragraph immediately follows it).
+    /// Interior-mutable so the immutable `Collector::par` scan can set it; it is
+    /// never hashed (PlacedChild already holds a non-hashed `CachedCell`).
+    pub wrap_active: std::cell::Cell<bool>,
     pub clearance: Abs,
     pub delta: Axes<Rel<Abs>>,
     elem: &'a Packed<PlaceElem>,

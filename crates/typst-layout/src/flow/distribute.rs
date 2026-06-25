@@ -4,9 +4,13 @@ use typst_library::layout::{
 };
 use typst_utils::Numeric;
 
+use typst_library::layout::AlignElem;
+use typst_library::text::TextElem;
+
+use super::wrap::{ExclusionBand, WrapProfile};
 use super::{
-    Child, Composer, FlowResult, LineChild, MultiChild, MultiSpill, PlacedChild,
-    SingleChild, Stop, Work,
+    Child, Composer, DeferredParChild, FlowResult, LineChild, MultiChild, MultiSpill,
+    PlacedChild, SingleChild, Stop, Work,
 };
 
 /// Distributes as many children as fit from `composer.work` into the first
@@ -18,6 +22,7 @@ pub fn distribute(composer: &mut Composer, regions: Regions) -> FlowResult<Frame
         items: vec![],
         sticky: None,
         stickable: None,
+        pending_wrap_float: None,
     };
     let init = distributor.snapshot();
     let forced = match distributor.run() {
@@ -62,6 +67,10 @@ struct Distributor<'a, 'b, 'x, 'y, 'z> {
     /// blocks are supposed to always be in the same page as the subsequent
     /// frame, but that is impossible in that case, which is thus pathological.
     stickable: Option<bool>,
+    /// The side-wrap float laid out by the immediately-preceding `placed()`
+    /// call, awaiting the deferred paragraph that wraps beside it. Single-slot:
+    /// POC guarantees float and paragraph are adjacent within one pass.
+    pending_wrap_float: Option<(Frame, FixedAlignment)>,
 }
 
 /// A snapshot of the distribution state.
@@ -82,6 +91,9 @@ enum Item<'a, 'b> {
     Frame(Frame, Axes<FixedAlignment>),
     /// A frame for an absolutely (not floatingly) placed child.
     Placed(Frame, &'b PlacedChild<'a>),
+    /// A side-wrap float: drawn at the current offset WITHOUT advancing it,
+    /// so the following deferred paragraph's lines overlap its top band.
+    WrapFloat(Frame, FixedAlignment),
 }
 
 impl Item<'_, '_> {
@@ -97,6 +109,7 @@ impl Item<'_, '_> {
                     })
             }
             Self::Placed(_, placed) => !placed.float,
+            Self::WrapFloat(..) => false,
             _ => false,
         }
     }
@@ -136,6 +149,7 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             Child::Single(single) => self.single(single)?,
             Child::Multi(multi) => self.multi(multi)?,
             Child::Placed(placed) => self.placed(placed)?,
+            Child::Deferred(deferred) => self.deferred_par(deferred)?,
             Child::Flush => self.flush()?,
             Child::Break(weak) => self.break_(*weak)?,
         }
@@ -198,7 +212,8 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
                     return false;
                 }
                 // These are "peeked beyond" for spacing collapsing purposes.
-                Item::Tag(_) | Item::Abs(_, 0) | Item::Placed(..) => {}
+                Item::Tag(_) | Item::Abs(_, 0) | Item::Placed(..)
+                | Item::WrapFloat(..) => {}
                 // Any kind of fractional spacing destructs weak relative
                 // spacing.
                 Item::Fr(.., None) => return false,
@@ -228,7 +243,8 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
                 // These are "peeked beyond" for spacing collapsing purposes.
                 // Weak absolute spacing, in particular, will be trimmed once
                 // we push the fractional spacing.
-                Item::Tag(_) | Item::Abs(..) | Item::Placed(..) => {}
+                Item::Tag(_) | Item::Abs(..) | Item::Placed(..)
+                | Item::WrapFloat(..) => {}
                 // For weak + strong fr spacing, we keep both, same as for
                 // weak + strong rel spacing.
                 Item::Fr(.., None) => return true,
@@ -252,7 +268,8 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
                     self.items.remove(i);
                     break;
                 }
-                Item::Tag(_) | Item::Abs(..) | Item::Placed(..) => {}
+                Item::Tag(_) | Item::Abs(..) | Item::Placed(..)
+                | Item::WrapFloat(..) => {}
                 Item::Frame(..) | Item::Fr(..) => break,
             }
         }
@@ -263,7 +280,8 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
         for item in self.items.iter().rev() {
             match *item {
                 Item::Abs(amount, 1..) => return amount,
-                Item::Tag(_) | Item::Abs(..) | Item::Placed(..) => {}
+                Item::Tag(_) | Item::Abs(..) | Item::Placed(..)
+                | Item::WrapFloat(..) => {}
                 Item::Frame(..) | Item::Fr(..) => break,
             }
         }
@@ -434,12 +452,11 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
 
     /// Processes an absolutely or floatingly placed child.
     fn placed(&mut self, placed: &'b PlacedChild<'a>) -> FlowResult<()> {
-        if placed.float && placed.wrap {
-            // A side-wrapping float anchors at its position in the text rather
-            // than being hoisted to the column top/bottom: lay it out, draw it
-            // flush to its side, and reserve its height so following content
-            // flows below it. (Reflowing the following paragraph *beside* it is
-            // wired in a later step; for now the text continues underneath.)
+        if placed.float && placed.wrap && placed.wrap_active.get() {
+            // A side-wrapping float that is immediately followed by a wrapping
+            // paragraph (`wrap_active` set at collect time): lay it out and draw
+            // it flush to its side WITHOUT reserving its height, so the
+            // following deferred paragraph flows BESIDE it, not under.
             let frame = placed.layout(self.composer.engine, self.regions.base())?;
 
             // Like any non-sticky in-flow frame, a wrap float interrupts a run
@@ -449,8 +466,29 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
                 self.stickable = None;
             }
 
-            // The float reserves its height in flow, so gate footnotes on that
-            // height (as `frame` does), not zero (as overlaid placement does).
+            // Footnotes still reserve against the float's real height; that is
+            // correct regardless of the wrapping.
+            self.composer
+                .footnotes(&self.regions, &frame, frame.height(), true, true)?;
+            self.flush_tags();
+            // Stash the frame so the next Child::Deferred can build its
+            // exclusion band without scanning the item stack.
+            self.pending_wrap_float = Some((frame.clone(), placed.align_x));
+            self.items.push(Item::WrapFloat(frame, placed.align_x));
+            return Ok(());
+        }
+        if placed.float && placed.wrap {
+            // A side-wrap float with no immediately-following wrapping paragraph
+            // (next child is a heading/list/another float/EOF): fall back to the
+            // Step-4 behavior — anchor in place and RESERVE its height so the
+            // following content flows cleanly BELOW it (no overlap).
+            let frame = placed.layout(self.composer.engine, self.regions.base())?;
+
+            if !frame.is_empty() {
+                self.sticky = None;
+                self.stickable = None;
+            }
+
             self.composer
                 .footnotes(&self.regions, &frame, frame.height(), true, true)?;
             self.flush_tags();
@@ -484,6 +522,126 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             self.items.push(Item::Placed(frame, placed));
         }
         Ok(())
+    }
+
+    /// Break a paragraph beside the immediately-preceding side-wrap float.
+    fn deferred_par(&mut self, d: &'b DeferredParChild<'a>) -> FlowResult<()> {
+        // The float must have been stashed by the immediately-preceding
+        // placed() call. If it is absent, the float and paragraph did not stay
+        // adjacent in this pass (region break / intervening child / hoisted
+        // float) — out of POC scope. Fall back to a normal full-width break.
+        let Some((frame, side)) = self.pending_wrap_float.take() else {
+            return self.deferred_par_uniform(d);
+        };
+
+        let float_height = frame.height();
+        let float_width = frame.width();
+
+        // Band relative to the paragraph top: the float sits at y=0 because it
+        // immediately precedes this paragraph (POC scope).
+        let band = ExclusionBand {
+            y0: Abs::zero(),
+            y1: float_height + d.clearance,
+            inset: float_width + d.clearance,
+            side, // the stashed float's align_x
+        };
+
+        let leading = d.elem.leading.resolve(d.styles);
+        let full_width = self.regions.size.x;
+
+        // Measure the true first-line frame height (the line pitch), then break
+        // the paragraph beside the float with that pitch. See `measure_line_height`.
+        let line_height = self.measure_line_height(d, full_width)?;
+
+        let profile =
+            WrapProfile::new(ecow::eco_vec![band], full_width, line_height, leading);
+
+        let frames = crate::inline::layout_par(
+            d.elem,
+            self.composer.engine,
+            d.locator.relayout(),
+            d.styles,
+            d.base,
+            d.expand,
+            d.par_situation,
+            Some(&profile),
+        )?
+        .into_frames();
+
+        // Emit lines through the SAME accounting helpers the non-deferred path
+        // uses (self.frame / self.rel), so region-height bookkeeping, baseline,
+        // and footnote handling match exactly. The WrapFloat item is already at
+        // this offset and does NOT advance it, so line 0 overlaps the float
+        // top; narrowing is internal to each (full-width) line frame.
+        let spacing = d.elem.spacing.resolve(d.styles);
+        let align = d.styles.resolve(AlignElem::alignment);
+
+        self.flush_tags();
+        self.rel(spacing.into(), 4);
+        for (i, frame) in frames.into_iter().enumerate() {
+            if i > 0 {
+                self.rel(leading.into(), 5);
+            }
+            self.frame(frame, align, false, false)?;
+        }
+        self.rel(spacing.into(), 4);
+        Ok(())
+    }
+
+    /// Fallback when a deferred paragraph arrives without a pending wrap float
+    /// (region break, intervening child, or hoisted float). Breaks it exactly
+    /// like Collector::par's normal path — full width, no wrap.
+    fn deferred_par_uniform(&mut self, d: &'b DeferredParChild<'a>) -> FlowResult<()> {
+        let lines = crate::inline::layout_par(
+            d.elem,
+            self.composer.engine,
+            d.locator.relayout(),
+            d.styles,
+            d.base,
+            d.expand,
+            d.par_situation,
+            None,
+        )?
+        .into_frames();
+        let spacing = d.elem.spacing.resolve(d.styles);
+        let leading = d.elem.leading.resolve(d.styles);
+        let align = d.styles.resolve(AlignElem::alignment);
+        self.flush_tags();
+        self.rel(spacing.into(), 4);
+        for (i, frame) in lines.into_iter().enumerate() {
+            if i > 0 {
+                self.rel(leading.into(), 5);
+            }
+            self.frame(frame, align, false, false)?;
+        }
+        self.rel(spacing.into(), 4);
+        Ok(())
+    }
+
+    /// Measure the true line pitch by breaking the paragraph once at uniform
+    /// full width and reading the real first-line frame height. Using the em
+    /// would under-estimate the line box and keep too many lines beside the
+    /// float. Costs one extra break; the wrap path is rare.
+    fn measure_line_height(
+        &mut self,
+        d: &DeferredParChild<'a>,
+        full_width: Abs,
+    ) -> FlowResult<Abs> {
+        let probe = crate::inline::layout_par(
+            d.elem,
+            self.composer.engine,
+            d.locator.relayout(),
+            d.styles,
+            Size::new(full_width, self.regions.size.y),
+            d.expand,
+            d.par_situation,
+            None,
+        )?
+        .into_frames();
+        Ok(probe
+            .first()
+            .map(|f| f.height())
+            .unwrap_or_else(|| d.styles.resolve(TextElem::size)))
     }
 
     /// Processes a float flush.
@@ -550,7 +708,9 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
                     used.y += frame.height();
                     used.x.set_max(frame.width());
                 }
-                Item::Tag(_) | Item::Placed(..) => {}
+                // A wrap float contributes no height/width; its space belongs
+                // to the paragraph that wraps beside it.
+                Item::Tag(_) | Item::Placed(..) | Item::WrapFloat(..) => {}
             }
         }
 
@@ -643,6 +803,15 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
                         + placed.delta.zip_map(size, Rel::relative_to).to_point();
 
                     output.push_frame(pos, frame);
+                }
+                Item::WrapFloat(frame, align_x) => {
+                    // Draw the float at the current flow position WITHOUT
+                    // advancing `offset`, so the following deferred paragraph's
+                    // line 0 draws at this same y and wraps beside it.
+                    let x = align_x.position(size.x - frame.width());
+                    let y = offset;
+                    output.push_frame(Point::new(x, y), frame);
+                    // offset unchanged — deliberately.
                 }
             }
         }

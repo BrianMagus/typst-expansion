@@ -34,7 +34,8 @@ use typst_utils::{LazyHash, NonZeroExt, Numeric, Protected};
 
 use self::block::{layout_multi_block, layout_single_block};
 use self::collect::{
-    Child, LineChild, MultiChild, MultiSpill, PlacedChild, SingleChild, collect,
+    Child, DeferredParChild, LineChild, MultiChild, MultiSpill, PlacedChild, SingleChild,
+    collect,
 };
 use self::compose::{Composer, compose};
 use self::distribute::distribute;

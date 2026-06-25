@@ -270,6 +270,17 @@ impl<'a, 'b> Composer<'a, 'b, '_, '_> {
         clearance: bool,
         migratable: bool,
     ) -> FlowResult<()> {
+        // Side-wrap floats are handled entirely by the distributor's
+        // placed()/deferred_par() path (anchored in place, broken beside or
+        // above their following content). They must never be hoisted here, as
+        // that would lose the wrap+anchor semantics and trigger Stop::Relayout.
+        // If we reach this with one — out of POC scope (e.g. it was queued) —
+        // treat it as a no-op: do not hoist, do not reserve, do not Relayout.
+        // (The POC fixture never hits this: the float fits, no prior floats.)
+        if placed.float && placed.wrap {
+            return Ok(());
+        }
+
         // If the float is already processed, skip it.
         let loc = placed.location();
         if self.skipped(loc) {

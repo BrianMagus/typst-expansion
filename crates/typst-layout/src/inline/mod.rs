@@ -36,12 +36,13 @@ use self::shaping::{
     BEGIN_PUNCT_PAT, END_PUNCT_PAT, ShapedGlyph, ShapedText, cjk_punct_style,
     is_of_cj_script, shape_range,
 };
-use crate::flow::wrap::WidthProvider;
+use crate::flow::wrap::{WidthProvider, WrapProfile};
 
 /// Range of a substring of text.
 type Range = std::ops::Range<usize>;
 
 /// Layouts the paragraph.
+#[allow(clippy::too_many_arguments)]
 pub fn layout_par(
     elem: &Packed<ParElem>,
     engine: &mut Engine,
@@ -50,21 +51,27 @@ pub fn layout_par(
     region: Size,
     expand: bool,
     situation: ParSituation,
+    wrap_profile: Option<&WrapProfile>,
 ) -> SourceResult<Fragment> {
-    layout_par_impl(
-        elem,
-        engine.world,
-        engine.library,
-        engine.introspector.into_raw(),
-        engine.traced,
-        TrackedMut::reborrow_mut(&mut engine.sink),
-        engine.route.track(),
-        locator.track(),
-        styles,
-        region,
-        expand,
-        situation,
-    )
+    match wrap_profile {
+        None => layout_par_impl(
+            elem,
+            engine.world,
+            engine.library,
+            engine.introspector.into_raw(),
+            engine.traced,
+            TrackedMut::reborrow_mut(&mut engine.sink),
+            engine.route.track(),
+            locator.track(),
+            styles,
+            region,
+            expand,
+            situation,
+        ),
+        Some(profile) => layout_par_wrapped(
+            elem, engine, locator, styles, region, expand, situation, profile,
+        ),
+    }
 }
 
 /// The internal, memoized implementation of `layout_par`.
@@ -120,6 +127,54 @@ fn layout_par_impl(
             first_line_indent: elem.first_line_indent.get(styles),
             hanging_indent: elem.hanging_indent.resolve(styles),
         },
+        None,
+    )
+}
+
+/// Non-memoized variant for the side-wrap-float path. Deliberately NOT
+/// #[comemo::memoize]: WrapProfile is rare and the distributor calls this
+/// exactly once per wrap float, so caching buys nothing and adding the
+/// profile to the memoized layout_par_impl key would invalidate the whole
+/// incremental cache for every non-wrap paragraph.
+#[allow(clippy::too_many_arguments)]
+fn layout_par_wrapped(
+    elem: &Packed<ParElem>,
+    engine: &mut Engine,
+    locator: Locator,
+    styles: StyleChain,
+    region: Size,
+    expand: bool,
+    situation: ParSituation,
+    profile: &WrapProfile,
+) -> SourceResult<Fragment> {
+    let link = LocatorLink::new(locator.track());
+    let mut locator = Locator::link(&link).split();
+
+    let arenas = Arenas::default();
+    let children = (engine.library.routines.realize)(
+        RealizationKind::Par,
+        engine,
+        &mut locator,
+        &arenas,
+        &elem.body,
+        styles,
+    )?;
+
+    layout_inline_impl(
+        engine,
+        &children,
+        &mut locator,
+        styles,
+        region,
+        expand,
+        Some(situation),
+        &ConfigBase {
+            justify: elem.justify.get(styles),
+            linebreaks: elem.linebreaks.get(styles),
+            first_line_indent: elem.first_line_indent.get(styles),
+            hanging_indent: elem.hanging_indent.resolve(styles),
+        },
+        Some(profile),
     )
 }
 
@@ -146,6 +201,7 @@ pub fn layout_inline<'a>(
             first_line_indent: shared.get(ParElem::first_line_indent),
             hanging_indent: shared.resolve(ParElem::hanging_indent),
         },
+        None,
     )
 }
 
@@ -160,6 +216,7 @@ fn layout_inline_impl<'a>(
     expand: bool,
     par: Option<ParSituation>,
     base: &ConfigBase,
+    wrap_profile: Option<&WrapProfile>,
 ) -> SourceResult<Fragment> {
     // Prepare configuration that is shared across the whole inline layout.
     let config = configuration(base, children, shared, par);
@@ -171,10 +228,13 @@ fn layout_inline_impl<'a>(
     // proceed to line breaking.
     let p = prepare(engine, &config, &text, segments, spans)?;
 
-    // Break the text into lines. Step 2 always uses a uniform measure; the
-    // variable-width (wrapping) path is wired in a later step.
-    let lines =
-        linebreak(engine, &p, WidthProvider::Uniform(region.x - config.hanging_indent));
+    // Break the text into lines. A non-empty wrap profile narrows the lines
+    // level with a side-wrap float; otherwise we use a uniform measure.
+    let width = match wrap_profile {
+        Some(p) if !p.is_empty() => WidthProvider::Variable(p),
+        _ => WidthProvider::Uniform(region.x - config.hanging_indent),
+    };
+    let lines = linebreak(engine, &p, width);
 
     // Turn the selected lines into frames.
     finalize(engine, &p, &lines, region, expand, locator)
