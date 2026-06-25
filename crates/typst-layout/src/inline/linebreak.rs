@@ -162,15 +162,9 @@ pub fn linebreak<'a>(
         WidthProvider::Variable(_) => linebreak_simple(engine, p, width),
         WidthProvider::Uniform(uniform) => match p.config.linebreaks {
             Linebreaks::Simple => linebreak_simple(engine, p, width),
-            Linebreaks::Optimized => {
-                let mut lines = linebreak_optimized(engine, p, uniform);
-                // The optimized breaker uses one measure for all lines; record
-                // it so later stages see the same width they did before.
-                for line in &mut lines {
-                    line.available = uniform;
-                }
-                lines
-            }
+            // The optimized breaker only ever uses a single measure, so its
+            // lines never wrap: they keep the default zero `narrowing`/offset.
+            Linebreaks::Optimized => linebreak_optimized(engine, p, uniform),
         },
     }
 }
@@ -180,7 +174,9 @@ pub fn linebreak<'a>(
 fn stamp_line(line: &mut Line<'_>, width: WidthProvider<'_>, k: usize) {
     let (x_offset, available) = width.at(k);
     line.x_offset = x_offset;
-    line.available = available;
+    // Store the reduction from the full measure (zero when not wrapping) so
+    // `commit` shrinks the justification slack by exactly the reserved width.
+    line.narrowing = width.full_width() - available;
 }
 
 /// Performs line breaking in simple first-fit style. This means that we build

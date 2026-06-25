@@ -38,13 +38,14 @@ pub struct Line<'a> {
     /// Whether the line ends with a hyphen or dash, either naturally or through
     /// hyphenation.
     pub dash: Option<Dash>,
-    /// The horizontal offset at which the line is placed. Non-zero only beside
-    /// a side-wrapping float (the width reserved on the left); zero otherwise.
+    /// The horizontal offset at which the line's content starts. Non-zero only
+    /// beside a left side-wrapping float (the width it reserves); applied like
+    /// an extra hanging indent. Zero otherwise.
     pub x_offset: Abs,
-    /// The measure the line was broken against. Equals the region width for
-    /// normal lines and the narrowed width beside a wrapping float. Used for
-    /// justification and as the line frame's width.
-    pub available: Abs,
+    /// Horizontal space removed from this line's measure by a side-wrapping
+    /// float (the reserved width, on whichever side). Zero for normal lines, so
+    /// it shrinks the justification slack only when wrapping.
+    pub narrowing: Abs,
 }
 
 impl Line<'_> {
@@ -56,7 +57,7 @@ impl Line<'_> {
             justify: false,
             dash: None,
             x_offset: Abs::zero(),
-            available: Abs::zero(),
+            narrowing: Abs::zero(),
         }
     }
 
@@ -199,9 +200,9 @@ pub fn line<'a>(
     // Compute the line's width.
     let width = items.iter().map(Item::natural_width).sum();
 
-    // `x_offset`/`available` are stamped by the line breaker once the line's
-    // index (and thus its measure) is known; default to in-flow full width.
-    Line { items, width, justify, dash, x_offset: Abs::zero(), available: width }
+    // `x_offset`/`narrowing` are stamped by the line breaker once the line's
+    // index (and thus its float overlap) is known; default to no wrapping.
+    Line { items, width, justify, dash, x_offset: Abs::zero(), narrowing: Abs::zero() }
 }
 
 /// Collects / reshapes all items for the line with the given `range`.
@@ -503,7 +504,10 @@ pub fn commit(
     full: Abs,
     locator: &mut SplitLocator<'_>,
 ) -> SourceResult<Frame> {
-    let mut remaining = width - line.width - p.config.hanging_indent;
+    // A side-wrapping float reserves `narrowing` of the line's measure and, for
+    // a left float, shifts the content by `x_offset`. Both are zero for normal
+    // lines, so this matches the previous behavior exactly outside of wrapping.
+    let mut remaining = width - line.width - p.config.hanging_indent - line.narrowing;
     let mut offset = Abs::zero();
 
     // We always build the line from left to right. In an LTR paragraph, we must
@@ -512,6 +516,10 @@ pub fn commit(
     if p.config.dir == Dir::LTR {
         offset += p.config.hanging_indent;
     }
+
+    // Shift the line past a left float. Zero for normal lines and for right
+    // floats (which reserve space on the trailing side via `narrowing`).
+    offset += line.x_offset;
 
     // Handle hanging punctuation to the left.
     if let Some(text) = line.items.leading_text()

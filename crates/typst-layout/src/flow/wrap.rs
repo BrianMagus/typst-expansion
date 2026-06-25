@@ -141,6 +141,15 @@ impl WidthProvider<'_> {
     pub fn width_at(&self, k: usize) -> Abs {
         self.at(k).1
     }
+
+    /// The full measure with no exclusion. Used to derive how much a band
+    /// narrows a given line (`full_width - width_at(k)`).
+    pub fn full_width(&self) -> Abs {
+        match self {
+            Self::Uniform(width) => *width,
+            Self::Variable(profile) => profile.width(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +202,21 @@ mod tests {
         // Line 5: top 80, bottom 92 straddles y1 = 90 — still narrowed.
         let p = profile(FixedAlignment::Start);
         assert_eq!(p.at(5).1, Abs::pt(180.0));
+    }
+
+    #[test]
+    fn provider_narrowing_is_reserved_width() {
+        // The narrowing `commit` applies is `full_width - width_at(k)`.
+        let p = profile(FixedAlignment::Start);
+        let provider = WidthProvider::Variable(&p);
+        assert_eq!(provider.full_width(), Abs::pt(300.0));
+        // Beside the float: narrowed by the 120pt inset.
+        assert_eq!(provider.full_width() - provider.width_at(0), Abs::pt(120.0));
+        // Below the float: no narrowing.
+        assert_eq!(provider.full_width() - provider.width_at(6), Abs::zero());
+        // Uniform never narrows.
+        let uniform = WidthProvider::Uniform(Abs::pt(300.0));
+        assert_eq!(uniform.full_width() - uniform.width_at(0), Abs::zero());
     }
 
     #[test]
