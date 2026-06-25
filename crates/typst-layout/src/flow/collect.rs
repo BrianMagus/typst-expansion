@@ -292,26 +292,61 @@ impl<'a> Collector<'a, '_, '_> {
         let align_y = alignment.map(|align| align.y().map(|y| y.resolve(styles)));
         let scope = elem.scope.get(styles);
         let float = elem.float.get(styles);
+        let wrap = elem.wrap.get(styles);
 
-        match (float, align_y) {
-            (true, Smart::Custom(None | Some(FixedAlignment::Center))) => bail!(
-                elem.span(),
-                "vertical floating placement must be `auto`, `top`, or `bottom`"
-            ),
-            (false, Smart::Auto) => bail!(
-                elem.span(),
-                "automatic positioning is only available for floating placement";
-                hint: "you can enable floating placement with `place(float: true, ..)`";
-            ),
-            _ => {}
-        }
+        if wrap {
+            // Side-wrapping floats reflow surrounding text into a narrowed
+            // measure. They anchor in place (no vertical alignment, i.e. at the
+            // current flow position) on a definite horizontal side, within a
+            // single column. These rules supersede the general float rules
+            // below, since an in-place vertical anchor is otherwise rejected.
+            if !float {
+                bail!(
+                    elem.span(),
+                    "wrapping placement is only available for floating placement";
+                    hint: "you can enable floating placement with `place(float: true, ..)`";
+                );
+            }
+            if !matches!(align_x, FixedAlignment::Start | FixedAlignment::End) {
+                bail!(
+                    elem.span(),
+                    "wrapping placement requires a `left` or `right` alignment"
+                );
+            }
+            if !matches!(align_y, Smart::Custom(None)) {
+                bail!(
+                    elem.span(),
+                    "wrapping placement anchors the float at its position in the text";
+                    hint: "remove the `top`/`bottom`/`horizon` vertical alignment";
+                );
+            }
+            if scope == PlacementScope::Parent {
+                bail!(
+                    elem.span(),
+                    "wrapping placement is not supported for parent scope"
+                );
+            }
+        } else {
+            match (float, align_y) {
+                (true, Smart::Custom(None | Some(FixedAlignment::Center))) => bail!(
+                    elem.span(),
+                    "vertical floating placement must be `auto`, `top`, or `bottom`"
+                ),
+                (false, Smart::Auto) => bail!(
+                    elem.span(),
+                    "automatic positioning is only available for floating placement";
+                    hint: "you can enable floating placement with `place(float: true, ..)`";
+                ),
+                _ => {}
+            }
 
-        if !float && scope == PlacementScope::Parent {
-            bail!(
-                elem.span(),
-                "parent-scoped positioning is currently only available for floating placement";
-                hint: "you can enable floating placement with `place(float: true, ..)`";
-            );
+            if !float && scope == PlacementScope::Parent {
+                bail!(
+                    elem.span(),
+                    "parent-scoped positioning is currently only available for floating placement";
+                    hint: "you can enable floating placement with `place(float: true, ..)`";
+                );
+            }
         }
 
         let locator = self.locator.next(&elem.span());
@@ -322,6 +357,7 @@ impl<'a> Collector<'a, '_, '_> {
             align_y,
             scope,
             float,
+            wrap,
             clearance,
             delta,
             elem,
@@ -625,6 +661,9 @@ pub struct PlacedChild<'a> {
     pub align_y: Smart<Option<FixedAlignment>>,
     pub scope: PlacementScope,
     pub float: bool,
+    // Consumed by the wrap-layout path added in a later step; plumbed now.
+    #[allow(dead_code)]
+    pub wrap: bool,
     pub clearance: Abs,
     pub delta: Axes<Rel<Abs>>,
     elem: &'a Packed<PlaceElem>,

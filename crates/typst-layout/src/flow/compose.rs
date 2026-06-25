@@ -319,17 +319,25 @@ impl<'a, 'b> Composer<'a, 'b, '_, '_> {
         // Handle footnotes in the float.
         self.footnotes(regions, &frame, need, false, migratable)?;
 
-        // Determine the float's vertical alignment. We can unwrap the inner
-        // `Option` because `Custom(None)` is checked for during collection.
-        let align_y = placed.align_y.map(Option::unwrap).unwrap_or_else(|| {
-            // When the float's vertical midpoint would be above the middle of
-            // the page if it were layouted in-flow, we use top alignment.
-            // Otherwise, we use bottom alignment.
-            let used = base.y - remaining;
-            let half = need / 2.0;
-            let ratio = (used + half) / base.y;
-            if ratio <= 0.5 { FixedAlignment::Start } else { FixedAlignment::End }
-        });
+        // Determine the float's vertical alignment.
+        //
+        // A wrapping float anchors at its position in the text and carries
+        // `Custom(None)` (no vertical alignment). Until in-place anchoring is
+        // implemented, it is treated like an automatically-aligned float so it
+        // renders without panicking. For a non-wrapping float, `Custom(None)`
+        // cannot occur (it is rejected during collection).
+        let align_y = match placed.align_y {
+            Smart::Custom(Some(align)) => align,
+            Smart::Auto | Smart::Custom(None) => {
+                // When the float's vertical midpoint would be above the middle
+                // of the page if it were layouted in-flow, we use top
+                // alignment. Otherwise, we use bottom alignment.
+                let used = base.y - remaining;
+                let half = need / 2.0;
+                let ratio = (used + half) / base.y;
+                if ratio <= 0.5 { FixedAlignment::Start } else { FixedAlignment::End }
+            }
+        };
 
         // Select the insertion area where we'll put this float.
         let area = match placed.scope {
