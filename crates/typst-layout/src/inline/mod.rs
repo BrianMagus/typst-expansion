@@ -36,6 +36,7 @@ use self::shaping::{
     BEGIN_PUNCT_PAT, END_PUNCT_PAT, ShapedGlyph, ShapedText, cjk_punct_style,
     is_of_cj_script, shape_range,
 };
+use crate::flow::wrap::WidthProvider;
 
 /// Range of a substring of text.
 type Range = std::ops::Range<usize>;
@@ -170,8 +171,10 @@ fn layout_inline_impl<'a>(
     // proceed to line breaking.
     let p = prepare(engine, &config, &text, segments, spans)?;
 
-    // Break the text into lines.
-    let lines = linebreak(engine, &p, region.x - config.hanging_indent);
+    // Break the text into lines. Step 2 always uses a uniform measure; the
+    // variable-width (wrapping) path is wired in a later step.
+    let lines =
+        linebreak(engine, &p, WidthProvider::Uniform(region.x - config.hanging_indent));
 
     // Turn the selected lines into frames.
     finalize(engine, &p, &lines, region, expand, locator)

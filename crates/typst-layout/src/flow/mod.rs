@@ -4,6 +4,7 @@ mod block;
 mod collect;
 mod compose;
 mod distribute;
+pub(crate) mod wrap;
 
 pub(crate) use self::block::unbreakable_pod;
 

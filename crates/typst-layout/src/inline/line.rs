@@ -38,6 +38,13 @@ pub struct Line<'a> {
     /// Whether the line ends with a hyphen or dash, either naturally or through
     /// hyphenation.
     pub dash: Option<Dash>,
+    /// The horizontal offset at which the line is placed. Non-zero only beside
+    /// a side-wrapping float (the width reserved on the left); zero otherwise.
+    pub x_offset: Abs,
+    /// The measure the line was broken against. Equals the region width for
+    /// normal lines and the narrowed width beside a wrapping float. Used for
+    /// justification and as the line frame's width.
+    pub available: Abs,
 }
 
 impl Line<'_> {
@@ -48,6 +55,8 @@ impl Line<'_> {
             width: Abs::zero(),
             justify: false,
             dash: None,
+            x_offset: Abs::zero(),
+            available: Abs::zero(),
         }
     }
 
@@ -190,7 +199,9 @@ pub fn line<'a>(
     // Compute the line's width.
     let width = items.iter().map(Item::natural_width).sum();
 
-    Line { items, width, justify, dash }
+    // `x_offset`/`available` are stamped by the line breaker once the line's
+    // index (and thus its measure) is known; default to in-flow full width.
+    Line { items, width, justify, dash, x_offset: Abs::zero(), available: width }
 }
 
 /// Collects / reshapes all items for the line with the given `range`.
