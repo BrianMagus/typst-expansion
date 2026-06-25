@@ -226,46 +226,12 @@ impl<'a> Collector<'a, '_, '_> {
 
     /// Collect laid-out lines.
     fn lines(&mut self, lines: Vec<Frame>, leading: Abs, styles: StyleChain<'a>) {
-        let align = styles.resolve(AlignElem::alignment);
-        let costs = styles.get(TextElem::costs);
-
-        // Determine whether to prevent widow and orphans.
-        let len = lines.len();
-        let prevent_orphans =
-            costs.orphan() > Ratio::zero() && len >= 2 && !lines[1].is_empty();
-        let prevent_widows =
-            costs.widow() > Ratio::zero() && len >= 2 && !lines[len - 2].is_empty();
-        let prevent_all = len == 3 && prevent_orphans && prevent_widows;
-
-        // Store the heights of lines at the edges because we'll potentially
-        // need these later when `lines` is already moved.
-        let height_at = |i| lines.get(i).map(Frame::height).unwrap_or_default();
-        let front_1 = height_at(0);
-        let front_2 = height_at(1);
-        let back_2 = height_at(len.saturating_sub(2));
-        let back_1 = height_at(len.saturating_sub(1));
-
-        for (i, frame) in lines.into_iter().enumerate() {
+        let line_children = build_line_children(lines, leading, styles);
+        for (i, line) in line_children.into_iter().enumerate() {
             if i > 0 {
                 self.output.push(Child::Rel(leading.into(), 5));
             }
-
-            // To prevent widows and orphans, we require enough space for
-            // - all lines if it's just three
-            // - the first two lines if we're at the first line
-            // - the last two lines if we're at the second to last line
-            let need = if prevent_all && i == 0 {
-                front_1 + leading + front_2 + leading + back_1
-            } else if prevent_orphans && i == 0 {
-                front_1 + leading + front_2
-            } else if prevent_widows && i >= 2 && i + 2 == len {
-                back_2 + leading + back_1
-            } else {
-                frame.height()
-            };
-
-            self.output
-                .push(Child::Line(self.boxed(LineChild { frame, align, need })));
+            self.output.push(Child::Line(self.boxed(line)));
         }
     }
 
@@ -417,6 +383,56 @@ impl<'a> Collector<'a, '_, '_> {
     }
 }
 
+/// Build [`LineChild`]ren from laid-out line frames, computing the widow/orphan
+/// `need` for each line. Shared by `Collector::lines` (the normal paragraph
+/// path) and the distributor's deferred-wrap paths so that the `need` ladder is
+/// byte-identical across both. The caller is responsible for inserting the
+/// inter-line `Child::Rel`/spacing between consecutive children.
+pub(crate) fn build_line_children(
+    lines: Vec<Frame>,
+    leading: Abs,
+    styles: StyleChain,
+) -> Vec<LineChild> {
+    let align = styles.resolve(AlignElem::alignment);
+    let costs = styles.get(TextElem::costs);
+
+    // Determine whether to prevent widow and orphans.
+    let len = lines.len();
+    let prevent_orphans =
+        costs.orphan() > Ratio::zero() && len >= 2 && !lines[1].is_empty();
+    let prevent_widows =
+        costs.widow() > Ratio::zero() && len >= 2 && !lines[len - 2].is_empty();
+    let prevent_all = len == 3 && prevent_orphans && prevent_widows;
+
+    // Store the heights of lines at the edges because we'll potentially
+    // need these later when `lines` is already moved.
+    let height_at = |i| lines.get(i).map(Frame::height).unwrap_or_default();
+    let front_1 = height_at(0);
+    let front_2 = height_at(1);
+    let back_2 = height_at(len.saturating_sub(2));
+    let back_1 = height_at(len.saturating_sub(1));
+
+    let mut output = Vec::with_capacity(len);
+    for (i, frame) in lines.into_iter().enumerate() {
+        // To prevent widows and orphans, we require enough space for
+        // - all lines if it's just three
+        // - the first two lines if we're at the first line
+        // - the last two lines if we're at the second to last line
+        let need = if prevent_all && i == 0 {
+            front_1 + leading + front_2 + leading + back_1
+        } else if prevent_orphans && i == 0 {
+            front_1 + leading + front_2
+        } else if prevent_widows && i >= 2 && i + 2 == len {
+            back_2 + leading + back_1
+        } else {
+            frame.height()
+        };
+
+        output.push(LineChild { frame, align, need });
+    }
+    output
+}
+
 /// A prepared child in flow layout.
 ///
 /// The larger variants are bump-boxed to keep the enum size down.
@@ -445,7 +461,7 @@ pub enum Child<'a> {
 }
 
 /// A child that encapsulates a layouted line of a paragraph.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LineChild {
     pub frame: Frame,
     pub align: Axes<FixedAlignment>,
@@ -709,6 +725,20 @@ impl MultiSpill<'_, '_> {
     pub fn align(&self) -> Axes<FixedAlignment> {
         self.multi.align
     }
+}
+
+/// Remaining full-width lines of a wrapped paragraph, carried to the next
+/// region. Lines are already broken (continuation lines are full-width by
+/// construction); we only need to re-gate them against the new region. Mirrors
+/// `MultiSpill`'s role for the deferred side-wrap-float paragraph path.
+#[derive(Debug, Clone)]
+pub struct WrapSpill {
+    /// Pre-broken, full-width continuation line frames (in order).
+    pub lines: Vec<LineChild>,
+    /// Leading to insert between consecutive lines (`Rel` weakness 5).
+    pub leading: Abs,
+    /// Trailing paragraph spacing to emit after the last line (`Rel` weakness 4).
+    pub spacing: Abs,
 }
 
 /// A child that encapsulates a prepared placed element.
