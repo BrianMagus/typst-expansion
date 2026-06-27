@@ -116,6 +116,36 @@ impl WrapProfile {
     }
 }
 
+/// Whether a drop-cap exclusion band should continue past its opener paragraph.
+///
+/// An M-line opener consumes `consumed` of a full-N band of height `pitch * n`,
+/// leaving `remaining0 = (n − M)·pitch + leading`. The band continues iff the
+/// opener is at least one full line short of the cap (`remaining0 ≥ pitch`) AND a
+/// continuation paragraph actually follows (the caller checks the latter).
+///
+/// The `≥ pitch` floor is load-bearing, NOT a fraction of a line: an opener that
+/// EXACTLY fills the cap (M = n) still leaves `remaining0 = leading` (the band's
+/// `pitch·n` overshoots the last baseline by one leading). `leading` can exceed
+/// half a line in loose-leading modes (TTRPG / accessibility), so a `line_height/2`
+/// floor would spuriously continue and shrink the gap to the next paragraph from the
+/// paragraph spacing down to one leading. Since `leading < pitch` always, `≥ pitch`
+/// is off for M = n and on for every M < n.
+pub(crate) fn band_should_continue(
+    n: usize,
+    pitch: Abs,
+    consumed: Abs,
+    continuation_follows: bool,
+) -> bool {
+    let remaining0 = pitch * n as f64 - consumed;
+    remaining0 >= pitch && continuation_follows
+}
+
+/// Whether a still-live band is exhausted after a continuation paragraph
+/// consumed `lines_height` of it. A residual under half a line ends the run.
+pub(crate) fn band_is_exhausted(remaining: Abs, line_height: Abs) -> bool {
+    remaining <= line_height / 2.0
+}
+
 /// Supplies the available width for each line to the line breaker.
 ///
 /// `Uniform` is the non-wrapping case and keeps the breaker branch- and
@@ -233,5 +263,82 @@ mod tests {
             Abs::pt(4.0),
         );
         assert_eq!(p.at(0), (Abs::zero(), Abs::pt(300.0)));
+    }
+
+    // --- v1 drop-cap continuation gate + band lifecycle -------------------
+
+    #[test]
+    fn gate_off_when_no_continuation_follows() {
+        // N=3, pitch=16pt. A short opener (1 line, consumed≈12pt) leaves a tall
+        // residual, but with no continuation paragraph following, the gate is
+        // off → the opener takes today's clamped path (no active band).
+        let pitch = Abs::pt(16.0);
+        let consumed = Abs::pt(12.0); // one line
+        assert!(!band_should_continue(3, pitch, consumed, false));
+    }
+
+    #[test]
+    fn gate_on_for_short_opener_with_continuation() {
+        // Same short opener, but a continuation follows: gate fires.
+        // remaining0 = 48 − 12 = 36 ≥ pitch(16) → on.
+        let pitch = Abs::pt(16.0);
+        let consumed = Abs::pt(12.0);
+        assert!(band_should_continue(3, pitch, consumed, true));
+    }
+
+    #[test]
+    fn gate_off_when_opener_fills_the_cap() {
+        // A ≥N-line opener consumes (nearly) the whole N-line band: remaining0 is
+        // one leading (< pitch), so even with a continuation flag the gate stays
+        // off → byte-identical to today for the common case.
+        let pitch = Abs::pt(16.0);
+        // 3 lines + 2 leadings = 36 + 8 = 44pt consumed; band = 48pt;
+        // remaining0 = 4pt < pitch(16) → off.
+        let consumed = Abs::pt(44.0);
+        assert!(!band_should_continue(3, pitch, consumed, true));
+    }
+
+    #[test]
+    fn gate_off_for_full_opener_in_loose_leading_mode() {
+        // Regression guard: an M=N opener leaves remaining0 = leading. With LOOSE
+        // leading (line_height=10, leading=8, pitch=18) that leading (8pt) exceeds
+        // half a line (5pt) — a `line_height/2` floor would spuriously continue and
+        // shrink the next paragraph's gap. The `≥ pitch` floor keeps it off.
+        let pitch = Abs::pt(18.0);
+        let consumed = Abs::pt(46.0); // 3*10 + 2*8 = three full lines
+        // remaining0 = 54 − 46 = 8pt = one leading; 8 < pitch(18) → off.
+        assert!(!band_should_continue(3, pitch, consumed, true));
+    }
+
+    #[test]
+    fn band_exhaustion_threshold_is_half_a_line() {
+        let line_height = Abs::pt(12.0);
+        assert!(band_is_exhausted(Abs::pt(5.0), line_height)); // < 6pt → done
+        assert!(band_is_exhausted(Abs::pt(6.0), line_height)); // == 6pt → done
+        assert!(!band_is_exhausted(Abs::pt(7.0), line_height)); // > 6pt → continue
+    }
+
+    #[test]
+    fn continuation_band_narrows_exactly_the_level_lines() {
+        // A continuation paragraph wraps beside a residual band. With pitch=16pt
+        // and the residual band y1=32pt, lines 0 and 1 (tops 0, 16) are level
+        // with the cap and narrowed; line 2 (top 32) clears it and is full
+        // width. This is the "at(k) selects exactly the lines level with the
+        // cap" assertion for the continuation profile.
+        let residual_y1 = Abs::pt(32.0);
+        let p = WrapProfile::new(
+            eco_vec![ExclusionBand {
+                y0: Abs::zero(),
+                y1: residual_y1,
+                inset: Abs::pt(60.0),
+                side: FixedAlignment::Start,
+            }],
+            Abs::pt(300.0),
+            Abs::pt(12.0),
+            Abs::pt(4.0),
+        );
+        assert_eq!(p.at(0), (Abs::pt(60.0), Abs::pt(240.0))); // top 0 — beside
+        assert_eq!(p.at(1), (Abs::pt(60.0), Abs::pt(240.0))); // top 16 — beside
+        assert_eq!(p.at(2), (Abs::zero(), Abs::pt(300.0))); // top 32 — below
     }
 }

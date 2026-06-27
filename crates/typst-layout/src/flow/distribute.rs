@@ -1,13 +1,19 @@
 use typst_library::introspection::Tag;
 use typst_library::layout::{
-    Abs, Axes, FixedAlignment, Fr, Frame, FrameItem, Point, Region, Regions, Rel, Size,
+    Abs, Axes, FixedAlignment, Fr, Frame, FrameItem, Point, Ratio, Region, Regions,
+    Rel, Size, Transform,
 };
 use typst_utils::Numeric;
 
-use typst_library::text::TextElem;
+use comemo::Tracked;
+use typst_library::foundations::StyleChain;
+use typst_library::text::{TextElem, families, variant};
+use typst_library::World;
 
 use super::collect::build_line_children;
-use super::wrap::{ExclusionBand, WrapProfile};
+use super::wrap::{
+    ExclusionBand, WrapProfile, band_is_exhausted, band_should_continue,
+};
 use super::{
     Child, Composer, DeferredParChild, FlowResult, LineChild, MultiChild, MultiSpill,
     PlacedChild, SingleChild, Stop, WrapSpill, Work,
@@ -23,6 +29,7 @@ pub fn distribute(composer: &mut Composer, regions: Regions) -> FlowResult<Frame
         sticky: None,
         stickable: None,
         pending_wrap_float: None,
+        active_band: None,
     };
     let init = distributor.snapshot();
     let forced = match distributor.run() {
@@ -71,6 +78,40 @@ struct Distributor<'a, 'b, 'x, 'y, 'z> {
     /// call, awaiting the deferred paragraph that wraps beside it. Single-slot:
     /// POC guarantees float and paragraph are adjacent within one pass.
     pending_wrap_float: Option<(Frame, FixedAlignment)>,
+    /// A drop-cap exclusion band that outlived its opener paragraph (short
+    /// opener, M < N lines) and continues into the following paragraph(s). Set
+    /// by `deferred_par` when the gate fires; consumed by `continuation_par`;
+    /// cleared the moment the band is exhausted or a non-continuation child
+    /// arrives (which first emits a strong clearing gap). Lives on the
+    /// per-region distributor — a band never crosses a region break (§10g).
+    active_band: Option<ActiveBand>,
+}
+
+/// A live drop-cap exclusion band threaded across continuation paragraphs.
+///
+/// The cap frame is already painted at the opener; continuation paragraphs only
+/// narrow their lines beside the band's lower part. `remaining` is the unfilled
+/// vertical extent of the band (flow-y); each continuation subtracts the leading
+/// it owns plus the height of the lines it emits.
+#[derive(Clone, Copy)]
+struct ActiveBand {
+    /// Unconsumed vertical extent of the band (flow-y), measured from the top of
+    /// the next continuation paragraph.
+    remaining: Abs,
+    /// Horizontal space reserved on `side` (scaled cap width + clearance).
+    inset: Abs,
+    /// `Start` for a left float, `End` for a right float.
+    side: FixedAlignment,
+    /// Line pitch (line height + leading), uniform across the run.
+    pitch: Abs,
+    /// Leading between consecutive lines (intra-paragraph), used to build the
+    /// continuation's WrapProfile.
+    leading: Abs,
+    /// The single inter-paragraph gap each continuation owns. For a drop cap this
+    /// is the leading (so the cap sits beside evenly-leaded lines, §10d); for a
+    /// general image float it is the paragraph spacing (so wrapped paragraphs keep
+    /// their normal vertical rhythm beside the image).
+    gap: Abs,
 }
 
 /// A snapshot of the distribution state.
@@ -92,8 +133,11 @@ enum Item<'a, 'b> {
     /// A frame for an absolutely (not floatingly) placed child.
     Placed(Frame, &'b PlacedChild<'a>),
     /// A side-wrap float: drawn at the current offset WITHOUT advancing it,
-    /// so the following deferred paragraph's lines overlap its top band.
-    WrapFloat(Frame, FixedAlignment),
+    /// so the following deferred paragraph's lines overlap its top band. The
+    /// `Abs` is a vertical anchor delta added to the paint offset: zero for an
+    /// ordinary wrap float, and `line0_baseline − body_cap_height` for a drop
+    /// cap so the (scaled) cap-top registers on line 1's cap-top.
+    WrapFloat(Frame, FixedAlignment, Abs),
 }
 
 impl Item<'_, '_> {
@@ -146,6 +190,21 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
     ///   due to an insertion (float/footnote).
     /// - Returns `Err(Stop::Error(_))` if there was a fatal error.
     fn child(&mut self, child: &'b Child<'a>) -> FlowResult<()> {
+        // A live drop-cap band that is NOT being continued by this child must be
+        // cleared before the child is laid out, reserving the leftover float
+        // height with a STRONG gap so the next block can't overlap the cap
+        // (§10e). Tags pass through untouched (they collect between paragraphs);
+        // a continuation `Deferred` is handled by `continuation_par` below.
+        let is_continuation = matches!(child, Child::Deferred(d) if d.continuation);
+        if self.active_band.is_some()
+            && !is_continuation
+            && !matches!(child, Child::Tag(_))
+        {
+            let band = self.active_band.take().expect("checked is_some");
+            self.regions.size.y -= band.remaining;
+            self.items.push(Item::Abs(band.remaining, 0));
+        }
+
         match child {
             Child::Tag(tag) => self.tag(tag),
             Child::Rel(amount, weakness) => self.rel(*amount, *weakness),
@@ -154,6 +213,11 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             Child::Single(single) => self.single(single)?,
             Child::Multi(multi) => self.multi(multi)?,
             Child::Placed(placed) => self.placed(placed)?,
+            // A continuation paragraph wraps beside the live band; the opener
+            // (or a continuation that arrived with no band) takes deferred_par.
+            Child::Deferred(d) if d.continuation && self.active_band.is_some() => {
+                self.continuation_par(d)?
+            }
             Child::Deferred(deferred) => self.deferred_par(deferred)?,
             Child::Flush => self.flush()?,
             Child::Break(weak) => self.break_(*weak)?,
@@ -479,7 +543,11 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             // Stash the frame so the next Child::Deferred can build its
             // exclusion band without scanning the item stack.
             self.pending_wrap_float = Some((frame.clone(), placed.align_x));
-            self.items.push(Item::WrapFloat(frame, placed.align_x));
+            // `y_delta` starts at zero; `deferred_par` overwrites it (and the
+            // frame) in place for a drop cap once the first wrapped line's
+            // baseline and the body cap-height are known (R3).
+            self.items
+                .push(Item::WrapFloat(frame, placed.align_x, Abs::zero()));
             return Ok(());
         }
         if placed.float && placed.wrap {
@@ -541,7 +609,23 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
 
         let float_height = frame.height();
         let float_width = frame.width();
-        let band_bottom = float_height + d.clearance;
+
+        let leading = d.elem.leading.resolve(d.styles);
+        let full_width = self.regions.size.x;
+
+        // For a drop cap, the reserved vertical zone is exactly N line pitches
+        // (decoupled from the glyph box height — §3a), and the float is scaled
+        // so its cap span equals the N-line target. Both require the true line
+        // pitch, so measure it up front in that case; the ordinary wrap path
+        // keeps its original ordering byte-for-byte.
+        let (band_bottom, dropcap_n, pitch, line_height_pre) = match d.dropcap {
+            Some(n) if n >= 1 => {
+                let line_height = self.measure_line_height(d, full_width)?;
+                let pitch = line_height + leading;
+                (pitch * n as f64, Some(n), Some(pitch), Some(line_height))
+            }
+            _ => (float_height + d.clearance, None, None, None),
+        };
 
         // GUARD 0 (cache-consistent region): the float is laid out exactly once
         // by placed() against `regions.base()`; its cached height is only valid
@@ -571,18 +655,40 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             return self.wrap_fallback_reserve(d, frame, side);
         }
 
+        // For a drop cap, pre-scale the cap to its nominal N-line span so the
+        // exclusion band narrows by the *scaled* cap width (§3c). `n_eff` is
+        // re-clamped to the actual laid-out line count after breaking (R1), and
+        // the painted cap is re-derived from the original frame then — so a
+        // short opener never over-reserves. `scaled_cap_width` drives the band
+        // inset here; the painted frame + anchor are computed post-layout.
+        let scaled_cap_width = match (dropcap_n, pitch) {
+            (Some(n), Some(pitch)) => {
+                let body_cap_height = body_cap_height(self.composer.engine.world, d.styles);
+                let target = pitch * (n.saturating_sub(1)) as f64 + body_cap_height;
+                let cap_span = frame.height();
+                let scale = if cap_span > Abs::zero() {
+                    target / cap_span
+                } else {
+                    1.0
+                };
+                float_width * scale
+            }
+            _ => float_width,
+        };
+
         let band = ExclusionBand {
             y0: Abs::zero(),
             y1: band_bottom,
-            inset: float_width + d.clearance,
+            inset: scaled_cap_width + d.clearance,
             side, // the stashed float's align_x
         };
 
-        let leading = d.elem.leading.resolve(d.styles);
-        let full_width = self.regions.size.x;
-
-        // Measure the true line pitch, then break the paragraph beside the float.
-        let line_height = self.measure_line_height(d, full_width)?;
+        // Measure the true line pitch, then break the paragraph beside the
+        // float. The drop-cap path already measured it above; reuse that value.
+        let line_height = match line_height_pre {
+            Some(h) => h,
+            None => self.measure_line_height(d, full_width)?,
+        };
 
         let profile =
             WrapProfile::new(ecow::eco_vec![band], full_width, line_height, leading);
@@ -615,10 +721,141 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
         let line_children = build_line_children(frames, leading, d.styles);
 
         // Σ line heights, to emit a compensating gap if the float outlives the
-        // paragraph (so following content clears a taller-than-paragraph float).
+        // paragraph (so following content clears a taller-than-paragraph float),
+        // and to compute the band continuation gate. Computed BEFORE the
+        // dropcap scaling block so the gate can decide full-`n` vs clamped.
         let lines_height: Abs =
             line_children.iter().map(|l| l.frame.height()).sum::<Abs>()
                 + leading * (line_children.len().saturating_sub(1) as f64);
+
+        // CONTINUATION GATE (§10c — load-bearing regression guard): keep the cap
+        // at its FULL N lines (no n_eff clamp) and continue the band into the
+        // following paragraph(s) ONLY when (a) the cap outlives the opener by at
+        // least half a line, AND (b) a continuation `Deferred` actually follows.
+        // Both must hold, or every short-opener-with-no-continuation and every
+        // ≥N-line opener would diverge from today. The "did not spill" leg is
+        // only known post-emit; the spill path returns Err before the trailing
+        // rel, so trailing suppression is irrelevant there.
+        let continuation_follows = matches!(
+            self.composer.work.peek_next(),
+            Some(Child::Deferred(nd)) if nd.continuation
+        );
+        let want_active = continuation_follows
+            && match (dropcap_n, pitch) {
+                (Some(n), Some(pitch)) => band_should_continue(n, pitch, lines_height, true),
+                // General image float (no drop cap): continue while the float
+                // outlives the opener by at least half a line, so a tiny overhang
+                // doesn't start a one-line continuation beside a near-empty band.
+                _ => band_bottom - lines_height >= line_height / 2.0,
+            };
+
+        // Drop-cap anchoring + scaling (Tier 1 + Tier 2), computed HERE because
+        // the laid-out lines, the body cap-height, the pitch, and N all coexist
+        // in this scope (R3). For an ordinary wrap float this whole block is
+        // skipped and `band_bottom` is unchanged, keeping that path identical.
+        // The active-band branch scales to FULL `n` (band continues); the else
+        // branch keeps today's `n_eff` clamp + compensating gap verbatim.
+        let mut band_bottom = band_bottom;
+        let mut active_band_to_set: Option<ActiveBand> = None;
+        if let (Some(n), Some(pitch)) = (dropcap_n, pitch) {
+            // n_eff = full `n` when continuing (the cap stays N lines tall beside
+            // the continuation); else clamp to the laid-out line count so a short
+            // opener without a continuation never reserves phantom lines (R1).
+            let n_eff = if want_active {
+                n.max(1)
+            } else {
+                n.min(line_children.len()).max(1)
+            };
+            // The reserved zone is exactly N_eff pitches (not the glyph box).
+            band_bottom = pitch * n_eff as f64;
+
+            // line-0 cap-top anchor + cap span target, from real metrics.
+            let line0_baseline = line_children
+                .first()
+                .map(|l| l.frame.baseline())
+                .unwrap_or_default();
+            let body_cap_height = body_cap_height(self.composer.engine.world, d.styles);
+            let target = pitch * (n_eff.saturating_sub(1)) as f64 + body_cap_height;
+
+            // The cap frame is cap-trimmed (top-edge cap-height / bottom-edge
+            // baseline), so `frame.height()` is the cap span and `baseline()`
+            // ≈ `height()`. Guard a future markup change that breaks this.
+            debug_assert!(
+                (frame.baseline() - frame.height()).to_pt().abs() < 0.5,
+                "drop-cap frame must be cap-trimmed (baseline ≈ height)",
+            );
+
+            let cap_span = frame.height();
+            let scale = if cap_span > Abs::zero() {
+                target / cap_span
+            } else {
+                1.0
+            };
+
+            // Scale the cap frame so it REPORTS its scaled bounds, following the
+            // `layout_scale` precedent (transforms.rs: transform + set_size).
+            let mut scaled = frame.clone();
+            let ratio = Ratio::new(scale);
+            scaled.transform(Transform::scale(ratio, ratio));
+            scaled.set_size(Size::new(scaled.width() * scale, scaled.height() * scale));
+
+            // Paint the scaled cap-top at line 1's cap-top; its baseline then
+            // lands on line N's baseline.
+            let y_delta = line0_baseline - body_cap_height;
+
+            // Stage the band for continuation BEFORE moving `scaled` into the
+            // WrapFloat: the part of the (full-N) band the opener did NOT consume
+            // continues into the next paragraph(s). The inset is the SCALED cap
+            // width + clearance (matches the painted cap and the band the opener
+            // narrowed against). Pitch is uniform across the run (§10d), and the
+            // continuation owns its leading-sized gap.
+            if want_active {
+                // The threaded band's physical bottom is the cap's VISUAL baseline
+                // (line N's baseline = line0_baseline + (N−1)·pitch), NOT the line-box
+                // bottom pitch·N. pitch·N overshoots the cap by ~one leading and lands
+                // the continuation's lower boundary on an EXACT line top, where float
+                // rounding (`remaining` = 2·pitch + 1e-15) narrows one extra line beside
+                // empty space under the cap. Anchoring to the baseline puts the boundary
+                // mid-line — robust — and narrows exactly the lines level with the cap.
+                let cap_baseline = line0_baseline + pitch * (n_eff.saturating_sub(1)) as f64;
+                let remaining = (cap_baseline - lines_height).max(Abs::zero());
+                active_band_to_set = Some(ActiveBand {
+                    remaining,
+                    inset: scaled.width() + d.clearance,
+                    side,
+                    pitch,
+                    leading,
+                    gap: leading, // drop cap: leading-tight gap (§10d)
+                });
+            }
+
+            // Push the scaled frame + anchor onto the trailing WrapFloat that
+            // placed() left at the top of the item stack (nothing has been
+            // pushed since — same invariant wrap_fallback_reserve relies on).
+            if let Some(Item::WrapFloat(f, _, yd)) = self.items.last_mut() {
+                *f = scaled;
+                *yd = y_delta;
+            }
+        }
+
+        // General image float (no drop cap): continue the wrap into the following
+        // paragraph(s). Unlike a drop cap, the band's physical bottom is the FLOAT's
+        // own height (`band_bottom = float_height + clearance`), the inset is the
+        // float's own width, and the inter-paragraph gap is the paragraph SPACING
+        // (image floats keep their normal vertical rhythm). `pitch·N` boundary
+        // rounding isn't a concern here — `band_bottom` is the image's arbitrary
+        // height, so the lower edge lands mid-line.
+        if want_active && dropcap_n.is_none() {
+            let remaining = (band_bottom - lines_height).max(Abs::zero());
+            active_band_to_set = Some(ActiveBand {
+                remaining,
+                inset: float_width + d.clearance,
+                side,
+                pitch: line_height + leading,
+                leading,
+                gap: spacing,
+            });
+        }
 
         self.flush_tags();
         self.rel(spacing.into(), 4);
@@ -626,17 +863,137 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
         // Child::Line. Narrow band lines are guaranteed to fit (Guard 1); the
         // first full-width continuation line that doesn't fit spills the rest
         // (carrying the trailing `spacing` so it lands on the final region).
-        self.emit_wrapped_lines(line_children, leading, spacing, true)?;
-        // If we reach here, the whole paragraph fit (no spill). The lines plus
-        // the trailing spacing have advanced the offset by `lines_height +
-        // spacing`. If the float is taller than that, emit a compensating gap so
-        // the TOTAL advance is exactly `band_bottom` (no extra spacing on top),
-        // letting the next child clear a taller-than-text float without overlap.
+        // When continuing the band, SUPPRESS the trailing paragraph spacing so
+        // the continuation owns the single inter-paragraph (leading-sized) gap
+        // inside the band (§10d).
+        self.emit_wrapped_lines(line_children, leading, spacing, true, !want_active)?;
+
+        if let Some(band) = active_band_to_set {
+            // The opener completed in-region (no spill — emit_wrapped_lines
+            // returns Err on spill, short-circuiting before here) and a
+            // continuation follows: keep the band live and SKIP the compensating
+            // gap. The continuation paragraph(s) consume `remaining`.
+            self.active_band = Some(band);
+            return Ok(());
+        }
+
+        // No continuation: today's behavior. The lines plus the trailing spacing
+        // have advanced the offset by `lines_height + spacing`. If the float is
+        // taller than that, emit a compensating gap so the TOTAL advance is
+        // exactly `band_bottom` (no extra spacing on top), letting the next child
+        // clear a taller-than-text float without overlap.
         let advanced = lines_height + spacing;
         if advanced < band_bottom {
             let gap = band_bottom - advanced;
             self.regions.size.y -= gap;
             self.items.push(Item::Abs(gap, 0));
+        }
+        Ok(())
+    }
+
+    /// Wrap a continuation paragraph beside the lower part of a still-live
+    /// drop-cap band (set by `deferred_par` when the opener was too short to
+    /// fill the full-N cap). The cap is already painted at the opener — this
+    /// only narrows the lines level with the band's residual and updates
+    /// `active_band`. Single-region: a spill clears the band (§10g).
+    fn continuation_par(&mut self, d: &'b DeferredParChild<'a>) -> FlowResult<()> {
+        // Defensive: the dispatch guard guarantees `active_band` is Some, but if
+        // it somehow isn't, fall back to a plain full-width break. Copy it out so
+        // `self` is free to be borrowed mutably for the rest of the method.
+        let Some(mut band) = self.active_band else {
+            return self.deferred_par_uniform(d);
+        };
+
+        let spacing = d.elem.spacing.resolve(d.styles);
+        let full_width = self.regions.size.x;
+        let leading = band.leading;
+
+        // Own ONE inter-paragraph gap (`band.gap`): the leading for a drop cap so
+        // the cap sits beside evenly-leaded lines (§10d); the paragraph spacing for
+        // a general image float so wrapped paragraphs keep their normal rhythm. It
+        // consumes band height like a line would, keeping the band aligned to the
+        // float.
+        self.flush_tags();
+        self.rel(band.gap.into(), 4);
+        band.remaining = (band.remaining - band.gap).max(Abs::zero());
+
+        // Reuse the run's pitch (uniform across the run); do not re-probe.
+        let line_height = band.pitch - leading;
+
+        let profile = WrapProfile::new(
+            ecow::eco_vec![ExclusionBand {
+                y0: Abs::zero(),
+                y1: band.remaining,
+                inset: band.inset,
+                side: band.side,
+            }],
+            full_width,
+            line_height,
+            leading,
+        );
+
+        let frames = crate::inline::layout_par(
+            d.elem,
+            self.composer.engine,
+            d.locator.relayout(),
+            d.styles,
+            d.base,
+            d.expand,
+            d.par_situation,
+            Some(&profile),
+        )?
+        .into_frames();
+
+        // Same per-line pitch-variance guard as deferred_par: if a line's true
+        // height diverges from the probed pitch, the band assignment is
+        // unreliable — clear the band, reserve the residual float height, and
+        // break this paragraph full-width.
+        const EPS: f64 = 0.01;
+        let pitch_varies = frames
+            .iter()
+            .any(|f| (f.height() - line_height).to_pt().abs() > EPS);
+        if pitch_varies {
+            self.active_band = None;
+            self.regions.size.y -= band.remaining;
+            self.items.push(Item::Abs(band.remaining, 0));
+            return self.deferred_par_uniform(d);
+        }
+
+        // Apply the normal path's last-line content-hint tweak before building
+        // line children (§10h).
+        let mut frames = frames;
+        if let Some(line) = frames.last_mut() {
+            if line.content_hint() == '\0' {
+                line.set_content_hint('\n');
+            }
+        }
+        let frames = frames;
+        let line_children = build_line_children(frames, leading, d.styles);
+
+        let lines_height: Abs =
+            line_children.iter().map(|l| l.frame.height()).sum::<Abs>()
+                + leading * (line_children.len().saturating_sub(1) as f64);
+
+        // The cap is already painted; emit the (possibly narrowed) lines with
+        // their normal trailing paragraph spacing. A spill carries the rest
+        // full-width and clears the band below.
+        if let Err(stop) = self.emit_wrapped_lines(line_children, leading, spacing, true, true)
+        {
+            // A fatal error propagates unchanged. A region finish is a spill:
+            // single-region, the band cannot continue into the spill region (the
+            // float is painted here), so clear it (§10g). emit_wrapped_lines has
+            // already stashed the wrap_spill and advanced the work head.
+            self.active_band = None;
+            return Err(stop);
+        }
+
+        // Consume the band; if too little remains for another beside-line, end
+        // the run so the next paragraph flows full-width.
+        band.remaining = (band.remaining - lines_height).max(Abs::zero());
+        if band_is_exhausted(band.remaining, line_height) {
+            self.active_band = None;
+        } else {
+            self.active_band = Some(band);
         }
         Ok(())
     }
@@ -656,12 +1013,22 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             None,
         )?
         .into_frames();
+        // Apply the normal path's last-line content-hint tweak (collect.rs
+        // :219-222) so an over-deferred paragraph collapses weak spacing /
+        // paginates identically to a non-deferred one (§10h).
+        let mut lines = lines;
+        if let Some(line) = lines.last_mut() {
+            if line.content_hint() == '\0' {
+                line.set_content_hint('\n');
+            }
+        }
+        let lines = lines;
         let spacing = d.elem.spacing.resolve(d.styles);
         let leading = d.elem.leading.resolve(d.styles);
         let line_children = build_line_children(lines, leading, d.styles);
         self.flush_tags();
         self.rel(spacing.into(), 4);
-        self.emit_wrapped_lines(line_children, leading, spacing, true)?;
+        self.emit_wrapped_lines(line_children, leading, spacing, true, true)?;
         Ok(())
     }
 
@@ -704,12 +1071,18 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
     /// is the work head (so it is consumed and not re-processed — its remaining
     /// work now lives in `wrap_spill`), and `false` when draining an existing
     /// `wrap_spill` (no work head to consume).
+    ///
+    /// `emit_trailing` is `true` everywhere except the active-band opener, which
+    /// suppresses its trailing paragraph spacing so the continuation owns the
+    /// single inter-paragraph gap inside the band (§10d). On a spill the trailing
+    /// rel is never reached, so this flag is irrelevant there.
     fn emit_wrapped_lines(
         &mut self,
         lines: Vec<LineChild>,
         leading: Abs,
         spacing: Abs,
         advance_on_spill: bool,
+        emit_trailing: bool,
     ) -> FlowResult<()> {
         let mut iter = lines.into_iter().enumerate();
         while let Some((i, line)) = iter.next() {
@@ -736,8 +1109,11 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
             }
             self.frame(line.frame.clone(), line.align, false, false)?;
         }
-        // All lines emitted on this region: emit the trailing paragraph spacing.
-        self.rel(spacing.into(), 4);
+        // All lines emitted on this region: emit the trailing paragraph spacing,
+        // unless the caller (the active-band opener) owns it elsewhere.
+        if emit_trailing {
+            self.rel(spacing.into(), 4);
+        }
         Ok(())
     }
 
@@ -751,7 +1127,7 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
         // A continuation region starts at the top, so the leading-before-first
         // is suppressed by emit_wrapped_lines's `if i > 0`. The trailing
         // paragraph spacing is emitted by emit_wrapped_lines on completion.
-        self.emit_wrapped_lines(spill.lines, spill.leading, spill.spacing, false)
+        self.emit_wrapped_lines(spill.lines, spill.leading, spill.spacing, false, true)
     }
 
     /// Measure the true line pitch by breaking the paragraph once at uniform
@@ -943,12 +1319,15 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
 
                     output.push_frame(pos, frame);
                 }
-                Item::WrapFloat(frame, align_x) => {
+                Item::WrapFloat(frame, align_x, y_delta) => {
                     // Draw the float at the current flow position WITHOUT
                     // advancing `offset`, so the following deferred paragraph's
-                    // line 0 draws at this same y and wraps beside it.
+                    // line 0 draws at this same y and wraps beside it. For a
+                    // drop cap, `y_delta` pushes the (scaled) cap down so its
+                    // cap-top registers on line 1's cap-top; it is zero for an
+                    // ordinary wrap float, leaving that path byte-identical.
                     let x = align_x.position(size.x - frame.width());
-                    let y = offset;
+                    let y = offset + y_delta;
                     output.push_frame(Point::new(x, y), frame);
                     // offset unchanged — deliberately.
                 }
@@ -971,4 +1350,28 @@ impl<'a, 'b> Distributor<'a, 'b, '_, '_, '_> {
         *self.composer.work = snapshot.work;
         self.items.truncate(snapshot.items);
     }
+}
+
+/// Resolve the body cap-height for a paragraph's dominant text size, from the
+/// first available font family. Used by the drop-cap anchor/scale math so the
+/// registration is font-independent. Mirrors the metric-fetch pattern in
+/// `inline/line.rs` (`apply_shift`) and `inline/shaping.rs`. A mixed-font opener
+/// line uses the para's resolved (dominant) size — a documented limit.
+fn body_cap_height(world: Tracked<dyn World + '_>, styles: StyleChain) -> Abs {
+    let size = styles.resolve(TextElem::size);
+    let variant = variant(styles);
+    let variations = styles.get_cloned(TextElem::variations);
+    families(styles)
+        .find_map(|family| {
+            world
+                .book()
+                .select(family.as_str(), variant)
+                .and_then(|id| world.font(id))
+                .map(|font| font.instantiate(variant, size, &variations))
+        })
+        .map(|font| font.metrics().cap_height.at(size))
+        // No usable font: fall back to a typical cap-height ratio so the math
+        // stays finite. Drop caps always sit on real prose, so this is a
+        // defensive floor, not an expected path.
+        .unwrap_or_else(|| size * 0.7)
 }

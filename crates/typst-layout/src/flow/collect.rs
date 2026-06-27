@@ -48,9 +48,17 @@ pub fn collect<'a>(
         expand,
         output: Vec::with_capacity(children.len()),
         par_situation: ParSituation::First,
+        continuation_budget: 0,
     }
     .run(mode)
 }
+
+/// How many consecutive paragraphs after a general (non-drop-cap) wrap float may be
+/// deferred to continue the wrap. A photo-sized float spans only a handful of
+/// paragraphs; the distributor stops at band exhaustion, so this is just a ceiling
+/// that bounds re-layout cost (over-deferred paragraphs break full-width). A drop cap
+/// uses its exact line span `N` instead.
+const GENERAL_WRAP_CONTINUATION_PARS: usize = 8;
 
 /// State for collection.
 struct Collector<'a, 'x, 'y> {
@@ -62,6 +70,12 @@ struct Collector<'a, 'x, 'y> {
     locator: SplitLocator<'a>,
     output: Vec<Child<'a>>,
     par_situation: ParSituation,
+    /// Remaining paragraphs that may be chained as drop-cap continuations after
+    /// a short opener. Set to `N` when an opener defers with `dropcap:Some(n)`;
+    /// decremented as each consecutive paragraph chains; reset to `0` by any
+    /// non-par / non-tag child (or an ordinary, non-dropcap wrap float) so a run
+    /// never crosses a block boundary. v1 is drop-cap only.
+    continuation_budget: usize,
 }
 
 impl<'a> Collector<'a, '_, '_> {
@@ -146,6 +160,8 @@ impl<'a> Collector<'a, '_, '_> {
 
     /// Collect vertical spacing into a relative or fractional child.
     fn v(&mut self, elem: &'a Packed<VElem>, styles: StyleChain<'a>) {
+        // Any explicit spacing breaks a drop-cap continuation run.
+        self.continuation_budget = 0;
         self.output.push(match elem.amount {
             Spacing::Rel(rel) => {
                 Child::Rel(rel.resolve(styles), elem.weak.get(styles) as u8)
@@ -175,12 +191,15 @@ impl<'a> Collector<'a, '_, '_> {
                     // float, so the distributor reserves zero height for it
                     // (rather than the Step-4 under-the-float fallback).
                     p.wrap_active.set(true);
-                    Some(p.clearance)
+                    // Carry the float's drop-cap span (if any) onto the
+                    // deferred paragraph so the band builder can reserve N
+                    // lines and anchor/scale the cap (Tier 1 + Tier 2).
+                    Some((p.clearance, p.elem.dropcap.get(p.styles)))
                 }
                 _ => None,
             });
 
-        if let Some(clearance) = prev_float {
+        if let Some((clearance, dropcap)) = prev_float {
             // NOTE: this next() MUST stay here, before the push and before the
             // early return — it preserves SplitLocator ordering identical to
             // the non-deferred path so in-paragraph labels/refs resolve to the
@@ -194,10 +213,56 @@ impl<'a> Collector<'a, '_, '_> {
                 expand: self.expand,
                 par_situation: self.par_situation,
                 clearance,
+                dropcap,
+                continuation: false,
             })));
+            // Open a wrap-float continuation run. A drop cap bounds it by N (≤ N
+            // lines fit in ≤ N paragraphs — exact). A general image float can't know
+            // its line-height at collect time, so it gets a small static cap; the
+            // distributor stops the moment the band is exhausted (remaining ≤ 0) and
+            // any over-deferred tail just breaks full-width, so a float taller than
+            // the cap simply clears its remainder (graceful degradation).
+            self.continuation_budget = dropcap.unwrap_or(GENERAL_WRAP_CONTINUATION_PARS);
             self.par_situation = ParSituation::Consecutive;
             return Ok(());
         }
+
+        // Drop-cap continuation: this paragraph immediately follows a deferred
+        // opener (or an earlier continuation), with budget remaining. Defer it
+        // too so the distributor can wrap it beside the lower part of the cap.
+        // The immediately-preceding non-Tag child being a `Deferred` guarantees
+        // no intervening block ended the run (the normal-par path below resets
+        // the budget, and block()/v()/place() reset it as well).
+        if self.continuation_budget > 0
+            && self
+                .output
+                .iter()
+                .rev()
+                .find(|c| !matches!(c, Child::Tag(_)))
+                .is_some_and(|c| matches!(c, Child::Deferred(_)))
+        {
+            let locator = self.locator.next(&elem.span());
+            self.output.push(Child::Deferred(self.boxed(DeferredParChild {
+                elem,
+                styles,
+                locator,
+                base: self.base,
+                expand: self.expand,
+                par_situation: self.par_situation,
+                // Continuation builds its band from `active_band`, whose `inset`
+                // already folds in the opener's clearance; this field is unused
+                // on the continuation path, so zero is correct.
+                clearance: Abs::zero(),
+                dropcap: None,
+                continuation: true,
+            })));
+            self.continuation_budget -= 1;
+            self.par_situation = ParSituation::Consecutive;
+            return Ok(());
+        }
+
+        // Normal paragraph: any non-continuing paragraph ends a drop-cap run.
+        self.continuation_budget = 0;
 
         let lines = crate::inline::layout_par(
             elem,
@@ -246,6 +311,8 @@ impl<'a> Collector<'a, '_, '_> {
     /// Collect a block into a [`SingleChild`] or [`MultiChild`] depending on
     /// whether it is breakable.
     fn block(&mut self, elem: &'a Packed<BlockElem>, styles: StyleChain<'a>) {
+        // A block ends any drop-cap continuation run.
+        self.continuation_budget = 0;
         let locator = self.locator.next(&elem.span());
         let align = styles.resolve(AlignElem::alignment);
         let alone = self.children.len() == 1;
@@ -298,6 +365,9 @@ impl<'a> Collector<'a, '_, '_> {
         elem: &'a Packed<PlaceElem>,
         styles: StyleChain<'a>,
     ) -> SourceResult<()> {
+        // A placed element ends any drop-cap continuation run; if it is itself a
+        // wrap float, `par()` re-opens the run for its own opener.
+        self.continuation_budget = 0;
         let alignment = elem.alignment.get(styles);
         let align_x = alignment.map_or(FixedAlignment::Center, |align| {
             align.x().unwrap_or_default().resolve(styles)
@@ -489,6 +559,15 @@ pub struct DeferredParChild<'a> {
     pub par_situation: ParSituation,
     /// Clearance copied from the preceding float.
     pub clearance: Abs,
+    /// Drop-cap span (number of lines) copied from the preceding wrap float, if
+    /// it was a drop cap. `None` for ordinary side-wrap floats.
+    pub dropcap: Option<usize>,
+    /// `false` for the opener paragraph (immediately after the float, sets the
+    /// band); `true` for a chained continuation paragraph that wraps beside the
+    /// lower part of the same (full-N-tall) cap. The distributor routes a
+    /// continuation through `continuation_par` (band from `active_band`), the
+    /// opener through `deferred_par` (band from `pending_wrap_float`).
+    pub continuation: bool,
 }
 
 /// A child that encapsulates a prepared unbreakable block.

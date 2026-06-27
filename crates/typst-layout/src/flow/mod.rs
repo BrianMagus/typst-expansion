@@ -336,6 +336,19 @@ impl<'a, 'b> Work<'a, 'b> {
         self.children.first()
     }
 
+    /// Peek the next NON-TAG child after `head()` without advancing. Realization
+    /// interleaves introspection tags (start/end markers, labels) between
+    /// paragraphs, so the drop-cap opener — which uses this to decide whether a
+    /// continuation paragraph follows — must skip them, exactly as the collector's
+    /// predecessor scan (collect.rs `par`) does. Reading `children.get(1)` would
+    /// see a tag and wrongly conclude no continuation follows. Read-only.
+    fn peek_next(&self) -> Option<&'b Child<'a>> {
+        self.children
+            .iter()
+            .skip(1)
+            .find(|c| !matches!(c, Child::Tag(_)))
+    }
+
     /// Mark the `head()` child as processed, advancing the slice by one.
     fn advance(&mut self) {
         self.children = &self.children[1..];

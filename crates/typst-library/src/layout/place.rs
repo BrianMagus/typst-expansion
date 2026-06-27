@@ -149,6 +149,16 @@ pub struct PlaceElem {
     /// column width below it.
     pub wrap: bool,
 
+    /// Drop-cap mode: the number of lines the floated cap spans.
+    ///
+    /// When set on a @place.wrap[wrapping] float, the engine treats the float as
+    /// a drop cap: the exclusion band reserves exactly this many lines (instead
+    /// of being derived from the glyph box height), the cap is anchored to the
+    /// cap-top of the first wrapped line, and the cap frame is scaled so its
+    /// baseline lands on the baseline of line N — font-independently. Has no
+    /// effect unless `wrap` is `{true}`.
+    pub dropcap: Option<usize>,
+
     /// The spacing between the placed element and other elements in a floating
     /// layout.
     ///
